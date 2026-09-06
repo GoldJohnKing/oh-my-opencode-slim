@@ -1,5 +1,59 @@
 import { describe, expect, it } from 'bun:test';
-import { InterviewConfigSchema, PluginConfigSchema } from './schema';
+import {
+  InterviewConfigSchema,
+  PluginConfigSchema,
+  ProviderModelIdSchema,
+} from './schema';
+
+describe('ProviderModelIdSchema', () => {
+  it('accepts and preserves model remainders with spaces and nested segments', () => {
+    const ids = [
+      'of/MiniMax M3',
+      'of/Kimi K2.6',
+      'opencode-omniroute-live/of/Qwen3.8 27b',
+      'openai/gpt-5.6-luna',
+    ];
+
+    for (const id of ids) {
+      const result = ProviderModelIdSchema.safeParse(id);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toBe(id);
+      }
+    }
+  });
+
+  it('rejects missing provider/model parts and whitespace in the provider', () => {
+    for (const id of [
+      'model',
+      '/model',
+      'provider/',
+      ' provider/model',
+      'provider name/model',
+    ]) {
+      expect(ProviderModelIdSchema.safeParse(id).success).toBe(false);
+    }
+  });
+});
+
+describe('PluginConfigSchema ACP wrapper models', () => {
+  it('accepts and preserves a wrapper model ID with spaces and nested segments', () => {
+    const wrapperModel = 'opencode-omniroute-live/of/MiniMax M3';
+    const result = PluginConfigSchema.safeParse({
+      acpAgents: {
+        helper: {
+          command: 'acp-helper',
+          wrapperModel,
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.acpAgents?.helper?.wrapperModel).toBe(wrapperModel);
+    }
+  });
+});
 
 describe('PluginConfigSchema image_routing', () => {
   it('accepts image_routing: direct with observer disabled', () => {
