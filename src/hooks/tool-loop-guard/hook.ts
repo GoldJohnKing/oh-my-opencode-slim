@@ -238,9 +238,6 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       // never legitimate progress (#1139).
       if (WAIT_TOOLS.has(tool)) {
         resetTaskSupervision(sessionID);
-        if (input.callID) {
-          callKeys.set(input.callID, { sessionID, key: `wait:${tool}` });
-        }
         const runs = waitRuns.get(sessionID) ?? 0;
         if (runs >= WAIT_GUARD_BLOCK_AT) {
           log('[tool-loop-guard] blocked repeated wait tool call', {
@@ -251,6 +248,11 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
           throw new Error(
             `Refusing to execute "${tool}": a wait tool has already completed ${runs} times this turn and instructed you to end the turn. Do not call any more tools. Respond to the user in plain text and end your turn.`,
           );
+        }
+        // Record the call only when it will actually run. A refused call
+        // never reaches the after hook, so its entry would leak (#1140).
+        if (input.callID) {
+          callKeys.set(input.callID, { sessionID, key: `wait:${tool}` });
         }
         return;
       }
