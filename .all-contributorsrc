@@ -974,6 +974,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "gitslim",
+      "name": "gitslim",
+      "avatar_url": "https://avatars.githubusercontent.com/u/24612825?v=4",
+      "profile": "https://github.com/gitslim",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
