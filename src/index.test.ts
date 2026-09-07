@@ -751,6 +751,38 @@ describe('plugin config model inheritance', () => {
     }
   });
 
+  test('config() writes the visible orchestrator display name as default_agent', async () => {
+    const hooks = await loadConfiguredPlugin({
+      council: {
+        presets: { default: { alpha: { model: 'test/councillor' } } },
+      },
+      agents: {
+        orchestrator: { displayName: 'EngineeringLead' },
+        council: { displayName: 'ArchitectureCouncil' },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {};
+
+    try {
+      await hooks.config?.(hostConfig);
+
+      // The orchestrator's visible entry is keyed by its display name;
+      // canonical 'orchestrator' is only a hidden alias, so default_agent
+      // must target the display-name entry.
+      expect(hostConfig.default_agent).toBe('EngineeringLead');
+      const agents = hostConfig.agent as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(agents.EngineeringLead?.hidden).toBeUndefined();
+      expect(agents.orchestrator?.hidden).toBe(true);
+      expect(agents.ArchitectureCouncil?.hidden).toBeUndefined();
+      expect(agents.council?.hidden).toBe(true);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
   test('admission uses a direct host override from final agent config', async () => {
     await assertAdmissionUsesFinalModel(
       'fixer',
