@@ -368,6 +368,41 @@ describe('RuntimeConfig', () => {
     ]);
   });
 
+  test('modelArrays and runtimeChains retain nested spaced IDs and variants', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      preset: 'spaced',
+      presets: {
+        spaced: {
+          explorer: {
+            model: [
+              {
+                id: 'opencode-omniroute-live/of/MiniMax M3',
+                variant: 'fast',
+              },
+              { id: 'of/Kimi K2.6', variant: 'balanced' },
+              'opencode-omniroute-live/of/Qwen3.8 27b',
+            ],
+          },
+        },
+      },
+    });
+
+    expect(runtime.modelArrays.explorer).toEqual([
+      {
+        id: 'opencode-omniroute-live/of/MiniMax M3',
+        variant: 'fast',
+      },
+      { id: 'of/Kimi K2.6', variant: 'balanced' },
+      { id: 'opencode-omniroute-live/of/Qwen3.8 27b' },
+    ]);
+    expect(runtime.runtimeChains.explorer).toEqual([
+      'opencode-omniroute-live/of/MiniMax M3',
+      'of/Kimi K2.6',
+      'opencode-omniroute-live/of/Qwen3.8 27b',
+    ]);
+  });
+
   test('modelArrays excludes disabled councillor seats', () => {
     resetRegistry();
     const runtime = RuntimeConfig.init(DIRECTORY, {

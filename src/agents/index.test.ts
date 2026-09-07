@@ -534,6 +534,126 @@ describe('per-model variant in array config', () => {
   });
 });
 
+describe('spaced model ID registrations', () => {
+  const primary = 'opencode-omniroute-live/of/MiniMax M3';
+  const secondary = 'of/Kimi K2.6';
+  const fallback = 'opencode-omniroute-live/of/Qwen3.8 27b';
+
+  test('preserves named-preset arrays for built-in and custom subagents', () => {
+    const config = PluginConfigSchema.parse({
+      preset: 'spaced',
+      presets: {
+        spaced: {
+          explorer: {
+            model: [
+              { id: primary, variant: 'fast' },
+              { id: secondary, variant: 'balanced' },
+            ],
+          },
+          librarian: { model: primary, variant: 'direct' },
+          reviewer: {
+            model: [
+              { id: secondary, variant: 'precise' },
+              { id: fallback, variant: 'economy' },
+            ],
+          },
+        },
+      },
+      // Declaring the custom agent at the root lets the named preset supply
+      // its model plan while retaining the custom agent registration.
+      agents: { reviewer: { temperature: 0.2 } },
+    });
+    const runtime = runtimeFor(config);
+    const agents = createAgents(runtime);
+    const configs = getAgentConfigs(runtime);
+
+    expect(runtime.agent('explorer')?.model).toEqual([
+      { id: primary, variant: 'fast' },
+      { id: secondary, variant: 'balanced' },
+    ]);
+    expect(runtime.agent('reviewer')?.model).toEqual([
+      { id: secondary, variant: 'precise' },
+      { id: fallback, variant: 'economy' },
+    ]);
+    expect(runtime.agent('librarian')).toMatchObject({
+      model: primary,
+      variant: 'direct',
+    });
+
+    expect(
+      agents.find((agent) => agent.name === 'explorer')?._modelArray,
+    ).toEqual([
+      { id: primary, variant: 'fast' },
+      { id: secondary, variant: 'balanced' },
+    ]);
+    expect(
+      agents.find((agent) => agent.name === 'reviewer')?._modelArray,
+    ).toEqual([
+      { id: secondary, variant: 'precise' },
+      { id: fallback, variant: 'economy' },
+    ]);
+    expect(configs.explorer).toMatchObject({
+      model: primary,
+      variant: 'fast',
+      mode: 'subagent',
+    });
+    expect(configs.librarian).toMatchObject({
+      model: primary,
+      variant: 'direct',
+      mode: 'subagent',
+    });
+    expect(configs.reviewer).toMatchObject({
+      model: secondary,
+      variant: 'precise',
+      mode: 'subagent',
+    });
+  });
+
+  test('registers parsed council seats and ACP wrappers with spaced model IDs', () => {
+    const config = PluginConfigSchema.parse({
+      council: {
+        default_preset: 'spaced',
+        presets: {
+          spaced: {
+            alpha: {
+              model: [
+                { id: primary, variant: 'reasoning' },
+                { id: secondary, variant: 'fast' },
+              ],
+            },
+          },
+        },
+      },
+      acpAgents: {
+        bridge: {
+          command: 'bridge-acp',
+          wrapperModel: fallback,
+        },
+      },
+    });
+    const runtime = runtimeFor(config);
+    const agents = createAgents(runtime);
+    const configs = getAgentConfigs(runtime);
+    const councillor = agents.find(
+      (agent) => agent.name === 'councillor-alpha',
+    );
+
+    expect(councillor?._modelArray).toEqual([
+      { id: primary, variant: 'reasoning' },
+      { id: secondary, variant: 'fast' },
+    ]);
+    expect(councillor?.config.model).toBeUndefined();
+    expect(configs['councillor-alpha']).toMatchObject({
+      mode: 'subagent',
+      hidden: true,
+    });
+    expect(configs.bridge).toMatchObject({
+      model: fallback,
+      mode: 'subagent',
+    });
+  });
+});
+
 describe('skill permissions', () => {
   test('orchestrator gets command-style bundled skills allowed by default', () => {
     const agents = createAgents(runtimeFor());

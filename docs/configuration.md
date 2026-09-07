@@ -240,6 +240,10 @@ subprocess.
 
 ### Council configuration note
 
+- Councillor `model` and ACP `wrapperModel` values use `provider/model`
+  references. The provider must be nonempty and cannot contain whitespace or
+  `/`; the nonempty model remainder is retained verbatim and may contain spaces
+  and nested `/` values, such as `opencode-omniroute-live/of/MiniMax M3`.
 - The **Council agent model** is configured like any other agent, for example in
   `presets.<name>.council.model`.
 - The **councillor models** are configured separately under

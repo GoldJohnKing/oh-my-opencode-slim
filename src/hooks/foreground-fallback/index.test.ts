@@ -983,6 +983,49 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
     expect(showToast).not.toHaveBeenCalled();
   });
+
+  test('preserves nested spaced model IDs in the fallback prompt request', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      {
+        explorer: [
+          'opencode-omniroute-live/of/MiniMax M3',
+          'opencode-omniroute-live/of/Qwen3.8 27b',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-spaced-model-id',
+          agent: 'explorer',
+          providerID: 'opencode-omniroute-live',
+          modelID: 'of/MiniMax M3',
+          role: 'assistant',
+        },
+      },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-spaced-model-id',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    const call = mocks.promptAsync.mock.calls[0] as [
+      { body: { model: { providerID: string; modelID: string } } },
+    ];
+    expect(call[0].body.model).toEqual({
+      providerID: 'opencode-omniroute-live',
+      modelID: 'of/Qwen3.8 27b',
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

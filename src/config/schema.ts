@@ -4,13 +4,9 @@ import {
   DEFAULT_MAX_RETAINED_SNAPSHOTS,
 } from './constants';
 import { CouncilConfigSchema } from './council-schema';
+import { ProviderModelIdSchema } from './model-id-schema';
 
-export const ProviderModelIdSchema = z
-  .string()
-  .regex(
-    /^[^/\s]+\/[^\s]+$/,
-    'Expected provider/model format (provider/.../model)',
-  );
+export { ProviderModelIdSchema } from './model-id-schema';
 
 // Permission schemas — mirror the SDK's PermissionConfig type with shallow
 // validation. Action values are validated; unknown tool keys pass through.
