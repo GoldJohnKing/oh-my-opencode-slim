@@ -992,6 +992,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "BaconDroid",
+      "name": "BaconDroid",
+      "avatar_url": "https://avatars.githubusercontent.com/u/11067111?v=4",
+      "profile": "https://github.com/BaconDroid",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
