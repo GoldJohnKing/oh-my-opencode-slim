@@ -37,7 +37,7 @@ PATCH`),
     expect(parsed.hunks[0]).toEqual({
       type: 'add',
       path: 'added.txt',
-      contents: 'alpha',
+      contents: 'alpha\n',
     });
     expect(parsed.hunks[1]).toEqual({ type: 'delete', path: 'removed.txt' });
     expect(parsed.hunks[2]).toEqual({
