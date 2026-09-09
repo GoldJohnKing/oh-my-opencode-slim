@@ -698,7 +698,7 @@ Use this section as a map: start with installation, then jump to features, confi
   <p><sub>Every merged contribution leaves a mark on the realm.</sub></p>
 
   <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-110-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-111-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 </div>
 
@@ -856,6 +856,7 @@ Use this section as a map: start with installation, then jump to features, confi
     <tr>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/xiaolf0813"><img src="https://avatars.githubusercontent.com/u/314566924?v=4?s=100" width="100px;" alt="xiaolf0813"/><br /><sub><b>xiaolf0813</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=xiaolf0813" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/BaconDroid"><img src="https://avatars.githubusercontent.com/u/11067111?v=4?s=100" width="100px;" alt="BaconDroid"/><br /><sub><b>BaconDroid</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=BaconDroid" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://sprightly-strudel-e1f939.netlify.app/"><img src="https://avatars.githubusercontent.com/u/277080233?v=4?s=100" width="100px;" alt="Enoch"/><br /><sub><b>Enoch</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=bferanmi806-sketch" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

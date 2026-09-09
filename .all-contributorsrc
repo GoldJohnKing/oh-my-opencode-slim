@@ -1001,6 +1001,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "bferanmi806-sketch",
+      "name": "Enoch",
+      "avatar_url": "https://avatars.githubusercontent.com/u/277080233?v=4",
+      "profile": "https://sprightly-strudel-e1f939.netlify.app/",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
