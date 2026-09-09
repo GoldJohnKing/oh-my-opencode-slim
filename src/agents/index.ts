@@ -488,6 +488,8 @@ export function createAgents(
   const disabled = new Set(runtime.disabledAgents);
   if (!runtime.council) {
     disabled.add('council');
+    // The bare councillor is only meaningful as part of configured Council Mode.
+    disabled.add('councillor');
   }
 
   const primaryModel = runtime.primaryModel;

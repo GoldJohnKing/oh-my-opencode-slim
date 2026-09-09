@@ -850,8 +850,8 @@ describe('agent classification', () => {
 
     // Subagents
     for (const name of SUBAGENT_NAMES) {
-      // Council is a dual-mode agent ("all"), rest are subagents
-      if (name === 'council') {
+      // Council agents require council configuration; the rest are subagents.
+      if (name === 'council' || name === 'councillor') {
         expect(configs[name]).toBeUndefined();
       } else {
         expect(configs[name].mode).toBe('subagent');
@@ -930,31 +930,49 @@ describe('createAgents', () => {
     expect(names).toContain('fixer');
   });
 
-  test('creates exactly 7 agents by default (observer disabled, council unconfigured)', () => {
+  test('creates exactly 6 agents by default (observer and council disabled)', () => {
     const agents = createAgents(runtimeFor());
-    expect(agents.length).toBe(7);
+    expect(agents.length).toBe(6);
   });
 
-  test('does not create council when council is not configured', () => {
-    const agents = createAgents(runtimeFor());
+  test('does not create or register council agents without council config', () => {
+    const runtime = runtimeFor();
+    const agents = createAgents(runtime);
     const names = agents.map((a) => a.name);
     const orchestrator = agents.find((a) => a.name === 'orchestrator');
+    const configs = getAgentConfigs(runtime);
 
     expect(names).not.toContain('council');
+    expect(names).not.toContain('councillor');
+    expect(names.some((name) => name.startsWith('councillor-'))).toBe(false);
     expect(orchestrator?.config.prompt).not.toContain('@council');
+    expect(Object.hasOwn(configs, 'council')).toBe(false);
+    expect(Object.hasOwn(configs, 'councillor')).toBe(false);
+    expect(
+      Object.keys(configs).some((name) => name.startsWith('councillor-')),
+    ).toBe(false);
   });
 
-  test('creates council when council is configured', () => {
-    const agents = createAgents(
-      runtimeFor({
-        council: councilConfig(),
-      }),
-    );
+  test('creates council and councillors when council is configured', () => {
+    const runtime = runtimeFor({ council: councilConfig() });
+    const agents = createAgents(runtime);
     const names = agents.map((a) => a.name);
     const orchestrator = agents.find((a) => a.name === 'orchestrator');
+    const configs = getAgentConfigs(runtime);
 
     expect(names).toContain('council');
+    expect(names).toContain('councillor');
+    expect(names).toContain('councillor-alpha');
     expect(orchestrator?.config.prompt).toContain('@council');
+    expect(configs.council).toBeDefined();
+    expect(configs.councillor).toMatchObject({
+      mode: 'subagent',
+      hidden: true,
+    });
+    expect(configs['councillor-alpha']).toMatchObject({
+      mode: 'subagent',
+      hidden: true,
+    });
   });
 });
 
@@ -1107,7 +1125,7 @@ describe('council agent model resolution', () => {
   });
 
   test('councillor agent uses default model', () => {
-    const agents = createAgents(runtimeFor());
+    const agents = createAgents(runtimeFor({ council: councilConfig() }));
     const councillor = agents.find((a) => a.name === 'councillor');
     expect(councillor?.config.model).toBe(DEFAULT_MODELS.councillor);
   });
@@ -1570,9 +1588,13 @@ describe('disabled_agents', () => {
   test('protected agents cannot be disabled', () => {
     const config: PluginConfig = {
       disabled_agents: ['orchestrator', 'councillor'],
+      council: councilConfig(),
     };
-    const agents = createAgents(runtimeFor(config));
+    const runtime = runtimeFor(config);
+    const agents = createAgents(runtime);
     const names = agents.map((a) => a.name);
+    expect(runtime.disabledAgents.has('orchestrator')).toBe(false);
+    expect(runtime.disabledAgents.has('councillor')).toBe(false);
     expect(names).toContain('orchestrator');
     expect(names).toContain('councillor');
   });
@@ -1580,6 +1602,7 @@ describe('disabled_agents', () => {
   test('disabling council disables council agent', () => {
     const config: PluginConfig = {
       disabled_agents: ['council'],
+      council: councilConfig(),
     };
     const agents = createAgents(runtimeFor(config));
     const names = agents.map((a) => a.name);
@@ -1590,13 +1613,13 @@ describe('disabled_agents', () => {
 
   test('agent count decreases when agents are disabled', () => {
     const agents = createAgents(runtimeFor());
-    expect(agents.length).toBe(7); // observer disabled, council unconfigured
+    expect(agents.length).toBe(6); // observer and council disabled
 
     const disabledConfig: PluginConfig = {
       disabled_agents: ['observer', 'designer'],
     };
     const disabledAgents = createAgents(runtimeFor(disabledConfig));
-    expect(disabledAgents.length).toBe(6);
+    expect(disabledAgents.length).toBe(5);
   });
 
   test('getDisabledAgents respects protection rules', () => {
@@ -1615,9 +1638,10 @@ describe('disabled_agents', () => {
     };
     const agents = createAgents(runtimeFor(config));
     const names = agents.map((a) => a.name);
-    expect(agents.length).toBe(8);
+    expect(agents.length).toBe(7);
     expect(names).toContain('observer');
     expect(names).not.toContain('council');
+    expect(names).not.toContain('councillor');
   });
 });
 
