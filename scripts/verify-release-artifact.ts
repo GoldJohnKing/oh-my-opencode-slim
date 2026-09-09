@@ -208,6 +208,19 @@ function verifyFreshInstall(tarballPath: string) {
       cwd: installDir,
     });
 
+    const jsdomSmokeScript = [
+      "import { JSDOM } from 'jsdom';",
+      "const dom = new JSDOM('<p>hello</p>');",
+      "if (dom.window.document.querySelector('p')?.textContent !== 'hello') throw new Error('JSDOM did not construct the expected document');",
+      'dom.window.close();',
+      "console.log('jsdom constructs a document');",
+      'process.exit(0);',
+    ].join('\n');
+    console.log('Importing installed jsdom and constructing a document...');
+    run('node', ['--input-type=module', '--eval', jsdomSmokeScript], {
+      cwd: installDir,
+    });
+
     const tuiSmokeScript = [
       "import pkg from 'oh-my-opencode-slim/tui';",
       "if (pkg?.id !== 'oh-my-opencode-slim:tui') throw new Error('TUI export has an unexpected plugin id');",

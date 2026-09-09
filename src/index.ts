@@ -89,6 +89,7 @@ import {
 } from './utils';
 import type { ContextFile } from './utils/background-job-board';
 import { isPluginDisabledByEnv } from './utils/env';
+import { probeJSDOM } from './utils/jsdom';
 import { initLogger, log } from './utils/logger';
 import { SessionMetadataStore } from './utils/session-metadata';
 import { collapseSystemInPlace } from './utils/system-collapse';
@@ -120,21 +121,6 @@ async function appLog(
 // Debounce: only show image-skipped toast once per 60 seconds per project
 const lastImageSkippedToastByDir = new Map<string, number>();
 const IMAGE_SKIPPED_DEBOUNCE_MS = 60_000;
-
-/**
- * Probe jsdom at init time so the first webfetch call doesn't fail
- * silently. Logs a warning if jsdom can't be imported or instantiated,
- * but does not throw; the plugin works without webfetch.
- */
-async function probeJSDOM(): Promise<string | null> {
-  try {
-    const { JSDOM } = await import('jsdom');
-    new JSDOM('<!DOCTYPE html><html><body>test</body></html>');
-    return null;
-  } catch (err) {
-    return String(err);
-  }
-}
 
 // Module-level runtime preset tracking. Survives plugin re-inits triggered
 // by client.config.update() → Instance.dispose(). When the plugin function
