@@ -326,10 +326,11 @@ function renderAddContents(contents: string): string[] {
     return [];
   }
 
-  // Canonical contents are newline-terminated; the trailing empty element
-  // produced by split is the terminator, not an extra empty `+` line.
+  // Drop only the terminator's empty element, retaining unterminated lines.
   const lines = contents.split('\n');
-  lines.pop();
+  if (contents.endsWith('\n')) {
+    lines.pop();
+  }
   return lines.map((line) => `+${line}`);
 }
 
