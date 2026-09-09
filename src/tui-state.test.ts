@@ -414,6 +414,35 @@ describe('tui-state persistence', () => {
     expect(readTuiSnapshot(tempDir).agentModels.explorer).toBe('model-x');
   });
 
+  test('in-place rewrite preserving mtime is caught by ctime', () => {
+    recordTuiAgentModel({ agentName: 'explorer', model: 'model-x' }, tempDir);
+    const filePath = getTuiStatePath(tempDir);
+
+    // Pin mtime to a whole-millisecond date (utimes cannot restore
+    // sub-millisecond precision), then re-prime the memo so it holds a
+    // stat snapshot of this exact state.
+    const pinned = new Date('2000-01-01T00:00:00Z');
+    fs.utimesSync(filePath, pinned, pinned);
+    recordTuiAgentModel({ agentName: 'explorer', model: 'model-x' }, tempDir);
+    const statBefore = fs.statSync(filePath);
+
+    // In-place rewrite (same inode, same length): mtime restored via
+    // utimes. ctime cannot be restored by userspace, so the memo must
+    // invalidate and re-record the value from the real file.
+    const external = readTuiSnapshot(tempDir);
+    external.agentModels.explorer = 'model-y';
+    const fd = fs.openSync(filePath, 'w');
+    fs.writeSync(fd, `${JSON.stringify(external)}\n`);
+    fs.closeSync(fd);
+    fs.utimesSync(filePath, statBefore.atime, statBefore.mtime);
+    const statAfter = fs.statSync(filePath);
+    expect(statAfter.ino).toBe(statBefore.ino);
+    expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
+
+    recordTuiAgentModel({ agentName: 'explorer', model: 'model-x' }, tempDir);
+    expect(readTuiSnapshot(tempDir).agentModels.explorer).toBe('model-x');
+  });
+
   test('a transient read failure does not seed the memo with an empty snapshot', async () => {
     recordTuiAgentActivity(
       { sessionID: 's1', agentName: 'oracle', active: true },

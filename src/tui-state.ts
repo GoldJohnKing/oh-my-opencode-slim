@@ -214,18 +214,30 @@ function releaseStateLock(lock: TuiStateLock): void {
 // seed the memo. An identity mismatch (external rename) invalidates it.
 const lastKnownSnapshots = new Map<
   string,
-  { snapshot: TuiSnapshot; ino: number; mtimeMs: number; size: number }
+  {
+    snapshot: TuiSnapshot;
+    ino: number;
+    mtimeMs: number;
+    ctimeMs: number;
+    size: number;
+  }
 >();
 const LAST_KNOWN_SNAPSHOTS_MAX = 32;
 
 function statSnapshotFile(statePath: string): {
   ino: number;
   mtimeMs: number;
+  ctimeMs: number;
   size: number;
 } | null {
   try {
     const stat = fs.statSync(statePath);
-    return { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
+    return {
+      ino: stat.ino,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      size: stat.size,
+    };
   } catch {
     return null;
   }
@@ -273,6 +285,7 @@ function memoFor(statePath: string): TuiSnapshot | undefined {
     !stat ||
     stat.ino !== entry.ino ||
     stat.mtimeMs !== entry.mtimeMs ||
+    stat.ctimeMs !== entry.ctimeMs ||
     stat.size !== entry.size
   ) {
     lastKnownSnapshots.delete(statePath);
