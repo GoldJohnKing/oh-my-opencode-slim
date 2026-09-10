@@ -23,7 +23,8 @@ fallback), the wake condition is children without a terminal `outcome`
 - **Scheduler** (`index.ts`): `createOrchestratorWakeScheduler(ctx, options)`
   returns `{ event, observeChatMessage, triggerStoppedJobRecovery, suppress }`.
   - Tracks per-session local state (`generation` symbol, timer, continuous
-    idle flag) only; progress lives in the process gate.
+    idle flag, and archive suppression) only; progress lives in the process
+    gate.
   - Capability record (`probeSessionApis`): v1 keeps exactly the historical
     probe set (get/todo/children/status/promptAsync); v2 requires only
     list+promptAsync (get optional). `resolveWakeMode` maps the configured
@@ -33,8 +34,8 @@ fallback), the wake condition is children without a terminal `outcome`
     session, no input wait (`hasInputWait`), no fallback in progress, gate
     not stopped.
   - Reads a host snapshot (todo mode: todos + children + status map +
-    session model; children mode: children list + event-tracked parent
-    status + optional model) and computes a fingerprint; unchanged
+    session model/archive state; children mode: children list + event-tracked
+    parent status + optional model/archive state) and computes a fingerprint; unchanged
     fingerprints across wake attempts hit `ORCHESTRATOR_WAKE_UNCHANGED_CAP`
     (2) and stop.
   - Checkpoint classification (`classifyTodoSnapshot` /
@@ -45,7 +46,8 @@ fallback), the wake condition is children without a terminal `outcome`
   - Event bookkeeping: `lastStatusBySession` (busy-set + race guard),
     `childSessions`/`childEvidence` from `session.created` parentID links
     (both v1-shape and flat v2 events), all bounded at 512 entries FIFO and
-    cleared on `session.deleted`/dispose.
+    cleared on `session.deleted`/dispose. `session.updated` archive state
+    suppresses or restores the local session timer/generation.
   - Wakes via `promptAsync` with a static `<system-reminder>` text
     (`ORCHESTRATOR_WAKE_TEXT`, `ORCHESTRATOR_CHILDREN_WAKE_TEXT`, or
     `ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT`), reserving the wake before prompt
@@ -82,7 +84,7 @@ evaluate() (one-flight via gate)
     ├─ todo mode: active child? → schedule later; no incomplete todos? → end
     ├─ children mode: no active (outcome-less, fresh) child? → end
     ├─ fingerprint unchanged ≥ cap? → stop
-    ├─ recheck immediately before promptAsync
+    ├─ recheck archive state immediately before promptAsync
     ├─ commitWakeReservation
     └─ promptAsync(internal wake reminder; v2 children mode: delivery 'queue')
     ↓
@@ -121,6 +123,8 @@ busy (external) / errors / user activity → rearm cap
   committed), clear the expecting-busy marker, and log; the timer re-arms via
   the finally block unless stopped. Children-mode enumeration failures fall
   back to event tracking instead of suppressing.
+- Archived sessions clear their timer and generation on `session.updated`; v2
+  hosts without `session.get()` rely on that observed archive state.
 - `server.instance.disposed` clears timers, releases owners, and drops pending
   recovery + event-tracking state.
 - Model enrichment from `session.get` is fail-soft.

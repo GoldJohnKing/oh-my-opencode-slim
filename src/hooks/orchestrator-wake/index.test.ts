@@ -338,6 +338,150 @@ describe('orchestrator wake scheduler', () => {
     );
   });
 
+  test('does not wake an archived v1 session', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        promptAsync,
+        get: mock(async () => ({
+          data: {
+            time: { created: 1, updated: 1, archived: 123 },
+          },
+        })),
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(clock.pendingCount()).toBe(0);
+  });
+
+  test('archive update cancels an armed timer', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({ promptAsync }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    expect(clock.pendingCount()).toBe(1);
+
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        properties: { info: { id: 'p1', time: { archived: 123 } } },
+      },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(clock.pendingCount()).toBe(0);
+  });
+
+  test('archive update during evaluation blocks promptAsync', async () => {
+    const promptAsync = mock(async () => ({}));
+    let getCalls = 0;
+    let releaseLatestGet!: () => void;
+    const latestGet = new Promise<void>((resolve) => {
+      releaseLatestGet = resolve;
+    });
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        promptAsync,
+        get: mock(async () => {
+          if (getCalls++ === 1) await latestGet;
+          return { data: { time: { created: 1, updated: 1 } } };
+        }),
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(getCalls).toBe(2);
+
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        properties: { info: { id: 'p1', time: { archived: 123 } } },
+      },
+    });
+    releaseLatestGet();
+    await clock.advance(0);
+
+    expect(promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('suppresses stopped-job recovery for an archived v1 session', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        promptAsync,
+        get: mock(async () => ({
+          data: { time: { created: 1, updated: 1, archived: 123 } },
+        })),
+      }),
+    });
+
+    scheduler.triggerStoppedJobRecovery('p1');
+    await clock.advance(0);
+
+    expect(promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('unarchive allows future normal lifecycle activity', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({ promptAsync }),
+    });
+
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        properties: { info: { id: 'p1', time: { archived: 123 } } },
+      },
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        properties: { info: { id: 'p1', time: { created: 1, updated: 2 } } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('unrelated session updates do not cancel the parent timer', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({ promptAsync }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        properties: { info: { id: 'other', time: { archived: 123 } } },
+      },
+    });
+    expect(clock.pendingCount()).toBe(1);
+
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
   test('targets only orchestrator-managed sessions', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -1119,6 +1263,70 @@ describe('children-driven degraded mode (v2)', () => {
         query: { parentID: 'p1', directory: '/project' },
       }),
     );
+  });
+
+  test('does not wake an archived v2 session', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [{ id: 'c1', time: { updated: Date.now() } }],
+        get: mock(async () => ({
+          data: { time: { created: 1, updated: 1, archived: 123 } },
+        })),
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(clock.pendingCount()).toBe(0);
+  });
+
+  test('v2 without get uses observed archive state and preserves queue delivery', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [{ id: 'c1', time: { updated: Date.now() } }],
+      }),
+    });
+
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        data: { sessionID: 'p1', time: { archived: 123 } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).not.toHaveBeenCalled();
+
+    await scheduler.event({
+      event: {
+        type: 'session.updated',
+        data: { sessionID: 'p1', time: { created: 1, updated: 2 } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<[{ delivery?: string }]>
+    )[0]?.[0];
+    expect(call?.delivery).toBe('queue');
   });
 
   test('does not wake when every child has a terminal outcome', async () => {

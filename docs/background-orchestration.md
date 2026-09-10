@@ -387,6 +387,10 @@ Behavior:
 - Suppress/clear on question/permission input waits, `wait_for_user`, foreground
   fallback, session busy, session deletion, external user messages, and server
   disposal.
+- `session.time.archived` is authoritative when available. Archived sessions do
+  not receive periodic or stopped-job-recovery wakes; archive updates cancel
+  timers and stale evaluations, while an unarchive permits future lifecycle
+  activity. v2 hosts without `session.get()` use observed session updates.
 - One in-flight evaluation/wake per session. Status/waits/generation are
   rechecked immediately before `promptAsync`. Cooldown/reservation is recorded
   before the call so a failed `promptAsync` cannot storm retries.
