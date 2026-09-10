@@ -24,6 +24,7 @@
  * See docs/cache-verification.md.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { isRecord } from '../utils/guards';
 import {
   isMessageWithParts,
@@ -55,19 +56,44 @@ export interface TaggedSyntheticPartSpec {
   /**
    * Optional cache hint copied onto the created part. v1 callers never
    * pass it, so the v1 payload stays byte-identical; the v2 context
-   * bridge scopes a process default via `setDefaultSyntheticPartCacheHint`
-   * so every part injected on v2 carries it.
+   * bridge scopes a per-request default via
+   * `runWithSyntheticPartCacheHintScope` +
+   * `setDefaultSyntheticPartCacheHint` so every part injected on v2
+   * carries it, with concurrent transforms isolated.
    */
   cache?: SyntheticPartCacheHint;
 }
 
 /**
- * Current scoped default applied to parts whose spec omits `cache`.
- * ONLY the v2 context bridge may set it (set → run bridged transform →
- * restore); the v1 pipeline never executes inside that wrapper, so v1
- * bytes never change.
+ * Request-scoped default applied to parts whose spec omits `cache`.
+ *
+ * The v2 context bridge runs each bridged messages transform inside its own
+ * scope (`runWithSyntheticPartCacheHintScope`) because the v2 host serves
+ * different sessions' requests concurrently (per-session serialization
+ * only). A plain module global would let one session's restore clobber the
+ * default another session's in-flight transform still depends on — the
+ * AsyncLocalStorage store keeps concurrent set/restore pairs isolated.
+ *
+ * Outside a scope, a module-level fallback keeps the legacy set/restore
+ * helper working. The v1 pipeline never enters a scope and never sets a
+ * default, so v1 bytes never change.
  */
-let currentDefaultCacheHint: SyntheticPartCacheHint | undefined;
+const hintScope = new AsyncLocalStorage<{
+  hint?: SyntheticPartCacheHint;
+}>();
+
+/** Legacy fallback for `setDefaultSyntheticPartCacheHint` calls made outside
+ * a `runWithSyntheticPartCacheHintScope` (the v1 pipeline never makes any). */
+let unscopedDefaultCacheHint: SyntheticPartCacheHint | undefined;
+
+/**
+ * Run `fn` with an isolated cache-hint scope: `setDefaultSyntheticPartCacheHint`
+ * calls inside `fn` (and its async descendants) mutate only this scope, so
+ * concurrent callers cannot interleave their set/restore operations.
+ */
+export function runWithSyntheticPartCacheHintScope<T>(fn: () => T): T {
+  return hintScope.run({}, fn);
+}
 
 /**
  * Set the scoped default cache hint for parts created while the returned
@@ -77,10 +103,18 @@ let currentDefaultCacheHint: SyntheticPartCacheHint | undefined;
 export function setDefaultSyntheticPartCacheHint(
   hint: SyntheticPartCacheHint | undefined,
 ): () => void {
-  const previous = currentDefaultCacheHint;
-  currentDefaultCacheHint = hint;
+  const store = hintScope.getStore();
+  if (store) {
+    const previous = store.hint;
+    store.hint = hint;
+    return () => {
+      store.hint = previous;
+    };
+  }
+  const previous = unscopedDefaultCacheHint;
+  unscopedDefaultCacheHint = hint;
   return () => {
-    currentDefaultCacheHint = previous;
+    unscopedDefaultCacheHint = previous;
   };
 }
 
@@ -88,7 +122,8 @@ export function setDefaultSyntheticPartCacheHint(
 export function createTaggedSyntheticPart(
   spec: TaggedSyntheticPartSpec,
 ): MessagePart {
-  const cache = spec.cache ?? currentDefaultCacheHint;
+  const cache =
+    spec.cache ?? hintScope.getStore()?.hint ?? unscopedDefaultCacheHint;
   return {
     type: 'text',
     synthetic: true,

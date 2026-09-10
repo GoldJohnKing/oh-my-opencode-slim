@@ -1125,11 +1125,21 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
     const bridge = createSessionPromptBridge(async (input) => {
       calls.push(input as Record<string, unknown>);
     });
+    // Pre-learn the agent so the admission delivers immediately (the
+    // first-admission deferral is covered by its own tests below).
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_0', role: 'user', content: [{ type: 'text', text: 'x' }] }],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
+    calls.length = 0;
     await bridge.handlePrompt(makePromptEvent());
     expect(calls).toEqual([
       {
         sessionID: 'ses_p',
         messageID: 'msg_1',
+        agent: 'orchestrator',
         parts: [{ type: 'text', text: 'do the thing' }],
       },
     ]);
@@ -1148,8 +1158,16 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
     const bridge = createSessionPromptBridge(async (input) => {
       calls.push(input as Record<string, unknown>);
     });
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_0', role: 'user', content: [{ type: 'text', text: 'x' }] }],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
+    calls.length = 0;
     await bridge.handlePrompt(
       makePromptEvent({
+        messageID: 'msg_f',
         prompt: {
           text: '',
           files: [{ uri: 'file:///a.txt', name: 'a.txt' }],
@@ -1246,7 +1264,8 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
   test('handlePrompt feeds the real observeChatMessage consumers', async () => {
     // The v1 observeChatMessage gate that never passed via the context
     // emulation (no parts) must pass via the prompt hook: a non-synthetic
-    // text part + messageID present.
+    // text part + messageID present. Agent is pre-learned so the delivery
+    // is immediate (deferral is covered below).
     const observed: Array<{ sessionID: string; messageID?: string }> = [];
     const bridge = createSessionPromptBridge((input) => {
       observed.push({
@@ -1255,8 +1274,175 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
       });
       return Promise.resolve();
     });
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_0', role: 'user', content: [{ type: 'text', text: 'x' }] }],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
+    observed.length = 0;
     await bridge.handlePrompt(makePromptEvent());
     expect(observed).toEqual([{ sessionID: 'ses_p', messageID: 'msg_1' }]);
+  });
+
+  test('first prompt is deferred until the context event learns the agent (parts + agent together)', async () => {
+    // P1 regression: forwarding the first admitted prompt before the
+    // agent is learned gets it dropped by every v1 consumer (no
+    // sessionMetadata.setAgent → shouldManageSession false), and the
+    // agent-only context forward is dropped by the parts gate. The
+    // bridge must latch the first prompt and flush it when the first
+    // agent-bearing context event arrives.
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.handlePrompt(makePromptEvent());
+    expect(calls).toEqual([]); // deferred, not dropped-then-duplicated
+
+    await bridge.observeContext(
+      makeEvent(
+        [
+          {
+            id: 'msg_1',
+            role: 'user',
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        ],
+        {
+          sessionID: 'ses_p',
+          agent: 'orchestrator',
+          model: { id: 'claude-x', providerID: 'anthropic' },
+        },
+      ),
+    );
+    // Exactly ONE delivery, carrying parts + agent + model + messageID
+    // together (the no-parts state forward is superseded by the flush).
+    expect(calls).toEqual([
+      {
+        sessionID: 'ses_p',
+        messageID: 'msg_1',
+        agent: 'orchestrator',
+        model: { providerID: 'anthropic', modelID: 'claude-x' },
+        parts: [{ type: 'text', text: 'do the thing' }],
+      },
+    ]);
+
+    // Re-fired admission + repeated context events: still once.
+    await bridge.handlePrompt(makePromptEvent());
+    await bridge.observeContext(
+      makeEvent(
+        [
+          {
+            id: 'msg_1',
+            role: 'user',
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        ],
+        {
+          sessionID: 'ses_p',
+          agent: 'orchestrator',
+          model: { id: 'claude-x', providerID: 'anthropic' },
+        },
+      ),
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  test('deferred flush satisfies the v1 setAgent-before-consumers ordering', async () => {
+    // Replica of the real v1 chat.message handler ordering: an agent on
+    // the delivery registers the session agent BEFORE the consumers gate
+    // on it. The deferred flush must pass the consumers' gate where the
+    // old immediate forward (agent-less) and the old context forward
+    // (parts-less) both failed.
+    const sessionAgents = new Map<string, string>();
+    const consumerObserved: Array<string | undefined> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      if (input.agent) sessionAgents.set(input.sessionID, input.agent);
+      const isOrchestrator =
+        sessionAgents.get(input.sessionID) === 'orchestrator';
+      const hasExternalPart = Array.isArray(input.parts)
+        ? input.parts.some(
+            (part) =>
+              part &&
+              typeof part === 'object' &&
+              part.type === 'text' &&
+              part.synthetic !== true,
+          )
+        : false;
+      if (isOrchestrator && hasExternalPart) {
+        consumerObserved.push(input.messageID);
+      }
+    });
+    await bridge.handlePrompt(makePromptEvent());
+    await bridge.observeContext(
+      makeEvent(
+        [
+          {
+            id: 'msg_1',
+            role: 'user',
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        ],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
+    expect(consumerObserved).toEqual(['msg_1']);
+  });
+
+  test('fallback: next admission flushes a still-pending prompt best-known', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.handlePrompt(makePromptEvent()); // pending (no agent yet)
+    await bridge.handlePrompt(makePromptEvent({ messageID: 'msg_2' }));
+    // The pending first admission flushed best-known (no agent learned),
+    // the new one latched — order preserved.
+    expect(calls).toEqual([
+      {
+        sessionID: 'ses_p',
+        messageID: 'msg_1',
+        parts: [{ type: 'text', text: 'do the thing' }],
+      },
+    ]);
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_2', role: 'user', content: [{ type: 'text', text: 'x' }] }],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      sessionID: 'ses_p',
+      messageID: 'msg_2',
+      agent: 'orchestrator',
+      parts: [{ type: 'text', text: 'do the thing' }],
+    });
+  });
+
+  test('fallback: a context event past the pending admission flushes best-known', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.handlePrompt(makePromptEvent()); // pending msg_1
+    // Synthetic/compaction request for the same session: agent absent,
+    // trailing user message already past the pending admission.
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_9', role: 'user', content: [{ type: 'text', text: 's' }] }],
+        { sessionID: 'ses_p', agent: undefined as unknown as string },
+      ),
+    );
+    expect(calls).toEqual([
+      {
+        sessionID: 'ses_p',
+        messageID: 'msg_1',
+        parts: [{ type: 'text', text: 'do the thing' }],
+      },
+      // The no-agent state forward itself (trailing id of the new turn).
+      { sessionID: 'ses_p', messageID: 'msg_9' },
+    ]);
   });
 
   test('handlePrompt restores the internal-initiator marker from prompt metadata (wake admissions stay internal)', async () => {
@@ -1265,7 +1451,8 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
     // translation). The rebuilt parts view must carry the v1 part marker
     // so isInternalInitiatorPart consumers — orchestrator-wake's
     // observeChatMessage in particular — treat the admission as internal
-    // (no no-progress rearm, no timer clear).
+    // (no no-progress rearm, no timer clear). The marker must survive
+    // the deferred first-admission flush too.
     const calls: Array<Record<string, unknown>> = [];
     const bridge = createSessionPromptBridge(async (input) => {
       calls.push(input as Record<string, unknown>);
@@ -1276,6 +1463,13 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
         metadata: { 'oh-my-opencode-slim.internalInitiator': true },
       }),
     );
+    expect(calls).toEqual([]); // deferred
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_1', role: 'user', content: [{ type: 'text', text: 'w' }] }],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
     expect(calls[0]?.parts).toEqual([
       {
         type: 'text',
@@ -1284,6 +1478,7 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
         metadata: { 'oh-my-opencode-slim.internalInitiator': true },
       },
     ]);
+    expect(calls[0]?.agent).toBe('orchestrator');
     // The restored marker must satisfy the real v1 gate.
     const { isInternalInitiatorPart } = await import(
       '../utils/internal-initiator'
@@ -1296,10 +1491,18 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
     const bridge2 = createSessionPromptBridge(async (input) => {
       plainCalls.push(input as Record<string, unknown>);
     });
-    await bridge2.handlePrompt(
-      makePromptEvent({ prompt: { text: 'user text' } }),
+    await bridge2.observeContext(
+      makeEvent(
+        [{ id: 'msg_1', role: 'user', content: [{ type: 'text', text: 'x' }] }],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
     );
-    expect(plainCalls[0]?.parts).toEqual([{ type: 'text', text: 'user text' }]);
+    await bridge2.handlePrompt(
+      makePromptEvent({ messageID: 'msg_2', prompt: { text: 'user text' } }),
+    );
+    expect(plainCalls.at(-1)?.parts).toEqual([
+      { type: 'text', text: 'user text' },
+    ]);
   });
 
   test('malformed prompt events are ignored without throwing', async () => {
@@ -1428,5 +1631,71 @@ describe('context handler: native prompt mode + CacheHint', () => {
     );
     const outside = { ...probe.at(-1) } as Record<string, unknown>;
     expect(outside.cache).toBeUndefined();
+  });
+
+  test('interleaved transforms for two sessions keep their cache-hint scopes (P2 race)', async () => {
+    // Greptile P2 scenario: the v2 host serves different sessions'
+    // requests concurrently (per-session serialization only), so two
+    // context-hook invocations can overlap across the awaited messages
+    // transform. Session A's restore must not clear the scoped default
+    // session B's still-running transform injects with.
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const gates: Record<string, Array<() => void>> = {
+      ses_a: [],
+      ses_b: [],
+    };
+    const makeGatedTransform = (session: string) => {
+      return async (
+        _input: unknown,
+        output: {
+          messages: Array<{ info: { role: string }; parts: unknown[] }>;
+        },
+      ) => {
+        const target = output.messages.at(-1);
+        if (!target) throw new Error('no message');
+        await new Promise<void>((resolve) => {
+          gates[session].push(resolve);
+        });
+        appendTaggedSyntheticPart(target, {
+          text: `INJECTED ${session}`,
+          metadataKey: 'omos_test_tag',
+        });
+      };
+    };
+    const makeSessionEvent = (session: string) =>
+      makeEvent([{ id: 'u', role: 'user', content: [] }], {
+        sessionID: session,
+      });
+    const makeHandler = (session: string) =>
+      createSessionContextHandler({
+        interviewHandleContext: async () => {},
+        messagesTransform: makeGatedTransform(session),
+        syntheticPartCacheHint: { type: 'ephemeral' },
+      });
+
+    const eventA = makeSessionEvent('ses_a');
+    const eventB = makeSessionEvent('ses_b');
+    const pendingA = makeHandler('ses_a')(eventA);
+    await tick(); // A reaches its transform and parks on its gate
+    const pendingB = makeHandler('ses_b')(eventB);
+    await tick(); // B enters its transform scope and parks (A still set)
+
+    // Release A: it injects and restores its hint scope while B is parked.
+    for (const resolve of gates.ses_a ?? []) resolve();
+    await pendingA;
+    // Only now release B: its part must still carry the v2 cache hint.
+    for (const resolve of gates.ses_b ?? []) resolve();
+    await pendingB;
+
+    const injectedA = eventA.messages[0]?.content.at(-1) as Record<
+      string,
+      unknown
+    >;
+    const injectedB = eventB.messages[0]?.content.at(-1) as Record<
+      string,
+      unknown
+    >;
+    expect(injectedA.cache).toEqual({ type: 'ephemeral' });
+    expect(injectedB.cache).toEqual({ type: 'ephemeral' });
   });
 });

@@ -115,15 +115,26 @@ degrades that single feature with a log line instead of breaking the load.
       `cache-safe-injection` carry a v2 `ContentPart.cache`
       `{type: "ephemeral"}` hint (CacheHint tagging) so providers that
       honor manual breakpoints cap the injected zone's cache contribution;
-      the hint is scoped to the v2 bridge, so v1 payload bytes never
-      change.
+      the hint is scoped per request (an `AsyncLocalStorage` scope around
+      the bridged transform) so concurrent sessions' transforms cannot
+      interleave their set/restore, and the v1 pipeline never enters the
+      scope, so v1 payload bytes never change.
     - a native `ctx.session.hook("prompt")` registration (capability-
       guarded): the v2 prompt hook fires **once per admitted input** with
       the eventual inbox User `messageID`, giving the v1 `chat.message`
       consumers (task-session-manager / orchestrator-wake
       `observeChatMessage`, `toolLoopGuard.observeNewUserMessage`) true
-      once-per-admission fidelity with prompt parts. When it registers,
-      the context hook's per-request `chat.message` emulation narrows to
+      once-per-admission fidelity with prompt parts. The FIRST admitted
+      prompt per session is deferred until the first agent-bearing
+      context event arrives, then delivered once with parts + agent
+      together — the v1 `chat.message` handler only registers the session
+      agent when a delivery carries one, and its consumers gate on that
+      registration, so an agent-less first forward would be dropped (lost
+      input-wait latch clearing / wake-progress rearm). Bounded fallbacks
+      (next admission, or a context event whose trailing user message has
+      moved past the pending one) flush a still-pending prompt best-known
+      when no agent is ever learned. When the prompt hook registers, the
+      context hook's per-request `chat.message` emulation narrows to
       agent/model discovery; hosts that reject the hook name keep the
       full emulation as fallback.
     - `tool.execute.before/after` → `ctx.tool.hook` via
@@ -415,5 +426,8 @@ respawn, bounded by the same no-progress cap as v1.
   addition is CacheHint tagging: parts injected through
   `cache-safe-injection` while the v2 context bridge runs carry
   `cache: {type: "ephemeral"}` (v2 `ContentPart.cache`). The hint is
-  applied via a scoped default inside the v2 bridge only — v1 callers
-  never set it, so the v1 payload (and its snapshots) stay byte-identical.
+  applied via a per-request scoped default (AsyncLocalStorage — the v2
+  host serves different sessions' requests concurrently, so the scope
+  must be isolated per bridged transform) inside the v2 bridge only — v1
+  callers never set it, so the v1 payload (and its snapshots) stay
+  byte-identical.

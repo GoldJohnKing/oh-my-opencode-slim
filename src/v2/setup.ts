@@ -14,6 +14,7 @@
 import { loadPluginConfig } from '../config/loader';
 import { InterviewConfigSchema } from '../config/schema';
 import {
+  runWithSyntheticPartCacheHintScope,
   type SyntheticPartCacheHint,
   setDefaultSyntheticPartCacheHint,
 } from '../hooks/cache-safe-injection';
@@ -333,28 +334,35 @@ export function createSessionContextHandler(
       // CacheHint tagging (v2-only): parts injected through
       // cache-safe-injection while the bridged transform runs carry an
       // ephemeral cache hint (v2 ContentPart.cache), so providers cap the
-      // injected zone's cache contribution. Scoped set/restore — the v1
-      // pipeline never executes inside this wrapper, so v1 payload bytes
-      // never change (pinned by the v1 snapshot/property suites).
-      const restoreCacheHint = deps.syntheticPartCacheHint
-        ? setDefaultSyntheticPartCacheHint(deps.syntheticPartCacheHint)
-        : undefined;
-      try {
-        const v1messages = event.messages.map((m) => ({
-          info: m,
-          parts: m.content,
-        }));
-        await deps.messagesTransform({}, { messages: v1messages });
-        event.messages = v1messages.map((m) => {
-          const info = m.info as { content?: unknown };
-          info.content = m.parts;
-          return m.info;
-        }) as V2SessionContextEvent['messages'];
-      } catch (err) {
-        log('[v2] messages transform bridge failed', String(err));
-      } finally {
-        restoreCacheHint?.();
-      }
+      // injected zone's cache contribution. Scoped set/restore inside an
+      // isolated AsyncLocalStorage hint scope — the v2 host serves
+      // different sessions' requests concurrently, so a shared module
+      // default could be restored by one session's transform while
+      // another's is still injecting. The v1 pipeline never executes
+      // inside this wrapper, so v1 payload bytes never change (pinned by
+      // the v1 snapshot/property suites).
+      const messagesTransform = deps.messagesTransform;
+      await runWithSyntheticPartCacheHintScope(async () => {
+        const restoreCacheHint = deps.syntheticPartCacheHint
+          ? setDefaultSyntheticPartCacheHint(deps.syntheticPartCacheHint)
+          : undefined;
+        try {
+          const v1messages = event.messages.map((m) => ({
+            info: m,
+            parts: m.content,
+          }));
+          await messagesTransform({}, { messages: v1messages });
+          event.messages = v1messages.map((m) => {
+            const info = m.info as { content?: unknown };
+            info.content = m.parts;
+            return m.info;
+          }) as V2SessionContextEvent['messages'];
+        } catch (err) {
+          log('[v2] messages transform bridge failed', String(err));
+        } finally {
+          restoreCacheHint?.();
+        }
+      });
     }
   };
 }
@@ -391,10 +399,13 @@ function v1ModelFromContext(
 
 export interface V2SessionPromptBridge {
   /** `ctx.session.hook("prompt")` handler — one v1 chat.message delivery
-   * per admitted input (dedupe by messageID). */
+   * per admitted input (dedupe by messageID). The FIRST admission per
+   * session is deferred until the agent is learned (see
+   * `observeContext`) so it is delivered with parts + agent together. */
   handlePrompt(event: V2SessionPromptEvent): Promise<void>;
   /** Record per-session agent/model from context events; forward NEWLY
-   * learned state to the v1 chat.message hook. */
+   * learned state to the v1 chat.message hook, flushing any deferred
+   * first admission with the agent attached. */
   observeContext(event: V2SessionContextEvent): Promise<void>;
   /** Latest agent known for a session from the learned state above (the
    * identity source for transcript user-message enrichment). */
@@ -418,6 +429,22 @@ export interface V2SessionPromptBridge {
  * first-seen/changed state — preserving the v1 timing where the session
  * agent is known before the first tool call of a turn.
  *
+ * First-admission deferral: the v1 chat.message handler only registers
+ * the session agent (sessionMetadata.setAgent) when a delivery carries
+ * one, and its consumers gate on that registration
+ * (shouldManageSession → getAgent === 'orchestrator'). Forwarding the
+ * FIRST admitted prompt before any agent was learned would therefore be
+ * dropped by every consumer, and the follow-up agent-only forward (no
+ * parts) is dropped by the parts gate — the first external message's
+ * state effects (input-wait latch clearing, wake-progress rearm) would
+ * be lost. The bridge instead latches that first prompt per session and
+ * flushes it once the first agent-bearing context event arrives (parts +
+ * agent delivered together, mirroring v1's single chat.message). Bounded
+ * fallbacks keep delivery from being lost outright when no agent is ever
+ * learned: the next admitted prompt for the session flushes a
+ * still-pending one best-known, and so does a context event whose
+ * trailing user message shows the conversation has moved past it.
+ *
  * Child-session filtering: none, deliberately — the context-hook
  * emulation never filtered child sessions either, and every consumer
  * gates itself (e.g. `shouldManageSession`).
@@ -432,12 +459,26 @@ export function createSessionPromptBridge(
     string,
     { agent?: string; model?: { providerID: string; modelID: string } }
   >();
+  /** First admitted prompt per session, deferred until the agent is
+   * learned from a context event (bounded: one per session). */
+  const pendingPrompts = new Map<string, V1ChatMessageInput>();
 
   function trailingUserId(event: V2SessionContextEvent): string | undefined {
     const id = [...event.messages]
       .reverse()
       .find((message) => message.role === 'user')?.id;
     return typeof id === 'string' && id ? id : undefined;
+  }
+
+  async function deliver(
+    label: string,
+    input: V1ChatMessageInput,
+  ): Promise<void> {
+    try {
+      await chatMessage(input, undefined);
+    } catch (err) {
+      log(`[v2] ${label} chat.message bridge failed`, String(err));
+    }
   }
 
   return {
@@ -484,20 +525,29 @@ export function createSessionPromptBridge(
           if (isRecord(file)) parts.push({ type: 'file', ...file });
         }
       }
-      try {
-        await chatMessage(
-          {
-            sessionID,
-            messageID,
-            ...(state?.agent ? { agent: state.agent } : {}),
-            ...(state?.model ? { model: state.model } : {}),
-            ...(parts.length > 0 ? { parts } : {}),
-          },
-          undefined,
-        );
-      } catch (err) {
-        log('[v2] prompt-hook chat.message bridge failed', String(err));
+      const input: V1ChatMessageInput = {
+        sessionID,
+        messageID,
+        ...(state?.agent ? { agent: state.agent } : {}),
+        ...(state?.model ? { model: state.model } : {}),
+        ...(parts.length > 0 ? { parts } : {}),
+      };
+      if (state?.agent) {
+        await deliver('prompt-hook', input);
+        return;
       }
+      // Agent not yet learned: forwarding now would be dropped by every
+      // v1 consumer (see the first-admission deferral note above). Latch
+      // the prompt; the first agent-bearing context event flushes it with
+      // the agent attached. Bounded fallback: a still-pending prompt is
+      // flushed best-known when the next admission arrives, so delivery
+      // is deferred, never lost.
+      const pending = pendingPrompts.get(sessionID);
+      if (pending) {
+        await deliver('prompt-hook', pending);
+      }
+      pendingPrompts.set(sessionID, input);
+      pruneSessionMap(pendingPrompts);
     },
 
     async observeContext(event) {
@@ -510,37 +560,56 @@ export function createSessionPromptBridge(
           : undefined;
       const model = v1ModelFromContext(event.model);
       const previous = sessionState.get(sessionID);
-      if (
-        previous &&
+      const unchanged =
+        !!previous &&
         previous.agent === agent &&
         ((previous.model === undefined && model === undefined) ||
           (previous.model !== undefined &&
             model !== undefined &&
             previous.model.providerID === model.providerID &&
-            previous.model.modelID === model.modelID))
-      ) {
-        return; // nothing newly learned — once-per-admission fidelity holds
+            previous.model.modelID === model.modelID));
+      if (!unchanged) {
+        sessionState.set(sessionID, {
+          ...(agent ? { agent } : {}),
+          ...(model ? { model } : {}),
+        });
+        pruneSessionMap(sessionState);
       }
-      sessionState.set(sessionID, {
+      const pending = pendingPrompts.get(sessionID);
+      if (pending) {
+        if (agent && previous?.agent !== agent) {
+          // Agent newly learned: flush the deferred first admission with
+          // the agent attached — one delivery carrying parts + agent
+          // together, so the v1 chat.message handler registers the
+          // session agent BEFORE its consumers gate on it. This flush
+          // supersedes the no-parts state forward below (same trailing
+          // messageID, strictly more information).
+          pendingPrompts.delete(sessionID);
+          await deliver('agent-discovery', {
+            ...pending,
+            agent,
+            ...(model ? { model } : {}),
+          });
+          return;
+        }
+        if (
+          trailingUserId(event) &&
+          trailingUserId(event) !== pending.messageID
+        ) {
+          // The conversation moved past the pending admission without the
+          // agent ever being learned (e.g. a synthetic/compaction request
+          // followed): flush best-known so the delivery is not lost.
+          pendingPrompts.delete(sessionID);
+          await deliver('agent-discovery', pending);
+        }
+      }
+      if (unchanged) return; // nothing newly learned — once-per-admission fidelity holds
+      await deliver('agent-discovery', {
+        sessionID,
         ...(agent ? { agent } : {}),
         ...(model ? { model } : {}),
+        ...(trailingUserId(event) ? { messageID: trailingUserId(event) } : {}),
       });
-      pruneSessionMap(sessionState);
-      try {
-        await chatMessage(
-          {
-            sessionID,
-            ...(agent ? { agent } : {}),
-            ...(model ? { model } : {}),
-            ...(trailingUserId(event)
-              ? { messageID: trailingUserId(event) }
-              : {}),
-          },
-          undefined,
-        );
-      } catch (err) {
-        log('[v2] agent-discovery chat.message bridge failed', String(err));
-      }
     },
 
     agentForSession(sessionID) {
