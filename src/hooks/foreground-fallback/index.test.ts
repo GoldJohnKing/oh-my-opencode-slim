@@ -882,6 +882,169 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
   });
 
+  test('v1 promptBody carries no v2 modelSwitch flag and still claims the switch', async () => {
+    // v1 byte-identity: the shim-only `modelSwitch` arg must appear ONLY
+    // on v2 hosts, and a v1-shaped result (no `switched` key) keeps the
+    // model-switch bookkeeping.
+    const { mocks } = createMockClient();
+    const onModelChanged = mock();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+      undefined,
+      onModelChanged,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-1',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    const call = mocks.promptAsync.mock.calls[0] as [Record<string, unknown>];
+    expect('modelSwitch' in call[0]).toBe(false);
+    expect(onModelChanged).toHaveBeenCalledTimes(1);
+    expect(onModelChanged).toHaveBeenCalledWith('sess-1', 'openai/gpt-4o');
+  });
+
+  test('v2 host promptBody requests a required model switch', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+      hostFlavor: 'v2',
+    } as any);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-v2',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-v2',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    const call = mocks.promptAsync.mock.calls[0] as [Record<string, unknown>];
+    expect(call[0].modelSwitch).toBe('required');
+  });
+
+  test('switched:false result (v2 switch failure) skips the switch claim', async () => {
+    // The v2 shim degrades a failed switchModel into a prompt delivered on
+    // the CURRENT model; the manager must not record a model switch that
+    // did not happen (sessionModel feeds chain descent, the callback
+    // migrates provider accounting, the toast claims a switch).
+    const { mocks } = createMockClient({
+      promptAsyncImpl: async () => ({ switched: false }),
+    });
+    const onModelChanged = mock();
+    const showToast = mock(async () => ({}));
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test', hostFlavor: 'v2', client: { tui: { showToast } } },
+      3,
+      undefined,
+      onModelChanged,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-degrade',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-degrade',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    // The prompt was delivered exactly once — no busy-session abort dance.
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(onModelChanged).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  test('typed no-switchModel rejection is not treated as a busy session', async () => {
+    // Hosts without session.switchModel reject the required-switch replay
+    // with V2SwitchModelUnavailableError; aborting + retrying cannot fix a
+    // missing host capability, so the error must surface after ONE call.
+    const switchErr = new Error(
+      '[v2] host provides no session.switchModel; cannot switch model for fallback prompt',
+    );
+    switchErr.name = 'V2SwitchModelUnavailableError';
+    const { mocks } = createMockClient({
+      promptAsyncImpl: async () => {
+        throw switchErr;
+      },
+    });
+    const onModelChanged = mock();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test', hostFlavor: 'v2' } as any,
+      3,
+      undefined,
+      onModelChanged,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-noswitch',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-noswitch',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(onModelChanged).not.toHaveBeenCalled();
+  });
+
   test('shows a toast when fallback switches models on a transient error', async () => {
     const { mocks } = createMockClient();
     const showToast = mock(async () => ({}));

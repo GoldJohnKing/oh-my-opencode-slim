@@ -13,7 +13,12 @@
  * The v2 model-switch semantics (prompts carry no model; `switchModel`
  * must precede the prompt) are encapsulated in the `promptAsync`
  * translation, which is what lets the v1 foreground-fallback pipeline work
- * unmodified on v2.
+ * unmodified on v2. A failed `switchModel` degrades to steering on the
+ * current model (logged, `switched: false` on the result) because the
+ * prompt delivery is the load-bearing action; a host with NO
+ * `switchModel` rejects callers that declare `modelSwitch: 'required'`
+ * (foreground-fallback) while pin-callers (orchestrator-wake) keep the
+ * logged steer.
  */
 
 import { isRecord } from '../utils/guards';
@@ -292,9 +297,18 @@ export function buildPluginInput(
       // v1 prompt_async QUEUED its prompt. The optional `delivery` argument
       // lets callers preserve that on v2 ('queue' — orchestrator-wake);
       // the default stays 'steer' because the foreground-fallback replay
-      // must steer an in-flight run.
+      // must steer an in-flight run. The optional `modelSwitch` argument
+      // declares caller intent for the body model: 'required'
+      // (foreground-fallback — the model is the fallback TARGET, so a host
+      // without session.switchModel must fail loudly instead of silently
+      // replaying on the model that just failed); default callers pass the
+      // session's CURRENT model as a pin (orchestrator-wake) and keep the
+      // honest degrade-with-log steer.
       promptAsync: async (
-        args: Record<string, unknown> & { delivery?: 'steer' | 'queue' },
+        args: Record<string, unknown> & {
+          delivery?: 'steer' | 'queue';
+          modelSwitch?: 'required';
+        },
       ) => {
         if (!s.prompt) {
           throw new Error('[v2] session.prompt unavailable for promptAsync');
@@ -304,9 +318,29 @@ export function buildPluginInput(
           typeof modelRefFromBody
         >[0] & { parts?: Array<{ type?: string; text?: string }> };
         const ref = modelRefFromBody(body);
+        let switched = false;
         if (ref) {
           if (s.switchModel) {
-            await s.switchModel({ sessionID: sessionIDOf(args), model: ref });
+            // The prompt delivery is the load-bearing action: a failed
+            // model switch degrades to steering on the CURRENT model
+            // (logged here; `switched: false` on the result) instead of
+            // aborting the caller's fallback chain (upstream #1125).
+            try {
+              await s.switchModel({ sessionID: sessionIDOf(args), model: ref });
+              switched = true;
+            } catch (err) {
+              log('[v2][shim] session.switchModel failed', {
+                id: sessionIDOf(args),
+                model: ref,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          } else if (args?.modelSwitch === 'required') {
+            const switchErr = new Error(
+              '[v2] host provides no session.switchModel; cannot switch model for fallback prompt',
+            );
+            switchErr.name = 'V2SwitchModelUnavailableError';
+            throw switchErr;
           } else {
             log(
               '[v2][shim] session.switchModel unavailable; steering on the current model',
@@ -316,13 +350,19 @@ export function buildPluginInput(
         }
         const files = filesFromBody(args);
         const metadata = internalInitiatorMetadataFromBody(args);
-        return s.prompt({
+        const result = await s.prompt({
           sessionID: sessionIDOf(args),
           text: textFromBody(args),
           delivery,
           ...(files.length > 0 ? { files } : {}),
           ...(metadata ? { metadata } : {}),
         });
+        // `switched` reports whether the requested model switch was
+        // CONFIRMED, letting callers gate model-switch bookkeeping on the
+        // truth (foreground-fallback's "switched to fallback model"
+        // claim). Additive over the v2 ack record; callers that ignore
+        // the result are unaffected.
+        return isRecord(result) ? { ...result, switched } : { switched };
       },
       update: s.rename
         ? async (args: Record<string, unknown>) => {

@@ -335,7 +335,13 @@ so delegated subagents can run.
 
 When the foreground model hits a rate limit, the plugin switches the
 session's model (`session.switchModel`) and steers the re-prompt through
-`delivery: "steer"`.
+`delivery: "steer"`. A failing `switchModel` call degrades honestly: the
+re-prompt is still delivered (on the current model) and the plugin's logs
+record that no switch happened — the fallback chain is not aborted. On
+hosts without `session.switchModel`, the fallback replay is rejected with
+a clear error instead of silently replaying on the model that just failed
+(other prompt callers, like the orchestrator-wake scheduler, only pin the
+current model and keep steering).
 
 ## Limitations
 
