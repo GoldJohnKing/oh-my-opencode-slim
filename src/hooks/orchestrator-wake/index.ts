@@ -407,7 +407,11 @@ function readSessionArchiveState(session: unknown): boolean | undefined {
   ) {
     return undefined;
   }
-  return session.time.archived !== undefined;
+  const archived = session.time.archived;
+  if (archived === undefined || archived === null) return false;
+  return typeof archived === 'number' && Number.isFinite(archived)
+    ? true
+    : undefined;
 }
 
 function readEventArchiveState(event: {

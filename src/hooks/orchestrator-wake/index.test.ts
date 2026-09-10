@@ -360,6 +360,27 @@ describe('orchestrator wake scheduler', () => {
     expect(clock.pendingCount()).toBe(0);
   });
 
+  test('treats a null archive timestamp as unarchived for v1', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        promptAsync,
+        get: mock(async () => ({
+          data: {
+            time: { created: 1, updated: 1, archived: null },
+          },
+        })),
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
   test('archive update cancels an armed timer', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -1286,6 +1307,34 @@ describe('children-driven degraded mode (v2)', () => {
 
     expect(promptAsync).not.toHaveBeenCalled();
     expect(clock.pendingCount()).toBe(0);
+  });
+
+  test('treats a null archive timestamp as unarchived for v2', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [{ id: 'c1', time: { updated: Date.now() } }],
+        get: mock(async () => ({
+          data: {
+            time: { created: 1, updated: 1, archived: null },
+          },
+        })),
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<[{ delivery?: string }]>
+    )[0]?.[0];
+    expect(call?.delivery).toBe('queue');
   });
 
   test('v2 without get uses observed archive state and preserves queue delivery', async () => {
