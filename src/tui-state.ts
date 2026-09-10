@@ -80,6 +80,19 @@ export function readTuiSnapshot(projectDir: string): TuiSnapshot {
   }
 }
 
+// Locked-path reader: ENOENT is a first write; any other error must not
+// seed the memo (a fallback empty snapshot would swallow later retries).
+function readTuiSnapshotStrict(statePath: string): TuiSnapshot | null {
+  try {
+    return parseSnapshot(fs.readFileSync(statePath, 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return emptySnapshot();
+    }
+    return null;
+  }
+}
+
 export async function readTuiSnapshotAsync(
   projectDir: string,
 ): Promise<TuiSnapshot> {
@@ -92,7 +105,7 @@ export async function readTuiSnapshotAsync(
   }
 }
 
-function writeTuiSnapshot(snapshot: TuiSnapshot, projectDir: string): void {
+function writeTuiSnapshot(snapshot: TuiSnapshot, projectDir: string): boolean {
   try {
     const filePath = getTuiStatePath(projectDir);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -109,8 +122,10 @@ function writeTuiSnapshot(snapshot: TuiSnapshot, projectDir: string): void {
         // best-effort
       }
     }
+    return true;
   } catch {
     // TUI state is best-effort only.
+    return false;
   }
 }
 
@@ -194,11 +209,104 @@ function releaseStateLock(lock: TuiStateLock): void {
   }
 }
 
+// Last confirmed on-disk snapshot per project, keyed by identity
+// (ino,mtime,size). No-ops return before the lock; failed writes do not
+// seed the memo. An identity mismatch (external rename) invalidates it.
+const lastKnownSnapshots = new Map<
+  string,
+  {
+    snapshot: TuiSnapshot;
+    ino: number;
+    mtimeMs: number;
+    ctimeMs: number;
+    size: number;
+  }
+>();
+const LAST_KNOWN_SNAPSHOTS_MAX = 32;
+
+function statSnapshotFile(statePath: string): {
+  ino: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  size: number;
+} | null {
+  try {
+    const stat = fs.statSync(statePath);
+    return {
+      ino: stat.ino,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      size: stat.size,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function cloneSnapshot(snapshot: TuiSnapshot): TuiSnapshot {
+  return {
+    version: snapshot.version,
+    updatedAt: snapshot.updatedAt,
+    agentModels: { ...snapshot.agentModels },
+    agentVariants: { ...snapshot.agentVariants },
+    activeSessions: { ...snapshot.activeSessions },
+  };
+}
+
+function snapshotSectionsEqual(a: TuiSnapshot, b: TuiSnapshot): boolean {
+  return (
+    JSON.stringify(a.agentModels) === JSON.stringify(b.agentModels) &&
+    JSON.stringify(a.agentVariants) === JSON.stringify(b.agentVariants) &&
+    JSON.stringify(a.activeSessions) === JSON.stringify(b.activeSessions)
+  );
+}
+
+function rememberSnapshot(statePath: string, snapshot: TuiSnapshot): void {
+  const stat = statSnapshotFile(statePath);
+  if (!stat) {
+    lastKnownSnapshots.delete(statePath);
+    return;
+  }
+  if (
+    !lastKnownSnapshots.has(statePath) &&
+    lastKnownSnapshots.size >= LAST_KNOWN_SNAPSHOTS_MAX
+  ) {
+    const oldest = lastKnownSnapshots.keys().next().value;
+    if (oldest !== undefined) lastKnownSnapshots.delete(oldest);
+  }
+  lastKnownSnapshots.set(statePath, { snapshot, ...stat });
+}
+
+function memoFor(statePath: string): TuiSnapshot | undefined {
+  const entry = lastKnownSnapshots.get(statePath);
+  if (!entry) return undefined;
+  const stat = statSnapshotFile(statePath);
+  if (
+    !stat ||
+    stat.ino !== entry.ino ||
+    stat.mtimeMs !== entry.mtimeMs ||
+    stat.ctimeMs !== entry.ctimeMs ||
+    stat.size !== entry.size
+  ) {
+    lastKnownSnapshots.delete(statePath);
+    return undefined;
+  }
+  return entry.snapshot;
+}
+
 function updateSnapshot(
   projectDir: string,
   mutator: (snapshot: TuiSnapshot) => void,
 ): void {
   const statePath = getTuiStatePath(projectDir);
+
+  const memo = memoFor(statePath);
+  if (memo) {
+    const candidate = cloneSnapshot(memo);
+    mutator(candidate);
+    if (snapshotSectionsEqual(candidate, memo)) return; // no-op update
+  }
+
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
   } catch {
@@ -208,20 +316,18 @@ function updateSnapshot(
   if (!lock) return;
 
   try {
-    const snapshot = readTuiSnapshot(projectDir);
-    const beforeModels = JSON.stringify(snapshot.agentModels);
-    const beforeVariants = JSON.stringify(snapshot.agentVariants);
-    const beforeActiveSessions = JSON.stringify(snapshot.activeSessions);
+    const snapshot = readTuiSnapshotStrict(statePath);
+    if (!snapshot) return;
+    const before = cloneSnapshot(snapshot);
     mutator(snapshot);
-    if (
-      JSON.stringify(snapshot.agentModels) === beforeModels &&
-      JSON.stringify(snapshot.agentVariants) === beforeVariants &&
-      JSON.stringify(snapshot.activeSessions) === beforeActiveSessions
-    ) {
-      return; // state unchanged — skip the disk write
+    if (snapshotSectionsEqual(snapshot, before)) {
+      rememberSnapshot(statePath, snapshot);
+      return;
     }
     snapshot.updatedAt = Date.now();
-    writeTuiSnapshot(snapshot, projectDir);
+    if (writeTuiSnapshot(snapshot, projectDir)) {
+      rememberSnapshot(statePath, snapshot);
+    }
   } finally {
     releaseStateLock(lock);
   }
