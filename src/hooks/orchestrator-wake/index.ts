@@ -86,6 +86,7 @@ type TodoModeSnapshot = {
   children: Array<Record<string, unknown>>;
   status: Record<string, unknown>;
   model?: ContinuationModelSelection;
+  archiveState?: boolean;
 };
 
 /** Children-mode snapshot (v2 degraded mode / explicit 'children'). */
@@ -96,6 +97,7 @@ type ChildrenModeSnapshot = {
    * race guard covers it). */
   hostParentActive: boolean;
   model?: ContinuationModelSelection;
+  archiveState?: boolean;
 };
 
 type WakeSnapshot = TodoModeSnapshot | ChildrenModeSnapshot;
@@ -108,6 +110,7 @@ type LocalSessionState = {
   generation: symbol;
   timer: ReturnType<typeof setTimeout> | undefined;
   continuousIdle: boolean;
+  archived: boolean;
 };
 
 export type OrchestratorWakeConfig = {
@@ -379,9 +382,49 @@ export function buildOrchestratorWakeFingerprint(
 }
 
 function extractSessionID(event: {
-  properties?: { info?: { id?: string }; sessionID?: string };
+  properties?: unknown;
+  data?: unknown;
 }): string | undefined {
-  return event.properties?.info?.id || event.properties?.sessionID;
+  const payload = isObjectRecord(event.data)
+    ? event.data
+    : isObjectRecord(event.properties)
+      ? event.properties
+      : undefined;
+  const info = isObjectRecord(payload?.info) ? payload.info : payload;
+  if (typeof info?.id === 'string' && info.id) return info.id;
+  if (typeof payload?.sessionID === 'string' && payload.sessionID) {
+    return payload.sessionID;
+  }
+  return undefined;
+}
+
+function readSessionArchiveState(session: unknown): boolean | undefined {
+  if (
+    !isObjectRecord(session) ||
+    Array.isArray(session) ||
+    !isObjectRecord(session.time) ||
+    Array.isArray(session.time)
+  ) {
+    return undefined;
+  }
+  const archived = session.time.archived;
+  if (archived === undefined || archived === null) return false;
+  return typeof archived === 'number' && Number.isFinite(archived)
+    ? true
+    : undefined;
+}
+
+function readEventArchiveState(event: {
+  properties?: unknown;
+  data?: unknown;
+}): boolean | undefined {
+  const payload = isObjectRecord(event.data)
+    ? event.data
+    : isObjectRecord(event.properties)
+      ? event.properties
+      : undefined;
+  const info = isObjectRecord(payload?.info) ? payload.info : payload;
+  return readSessionArchiveState(info);
 }
 
 function isIdleEvent(
@@ -496,6 +539,7 @@ export function createOrchestratorWakeScheduler(
       generation: Symbol(sessionID),
       timer: undefined,
       continuousIdle: false,
+      archived: false,
     };
     localSessions.set(sessionID, created);
     return created;
@@ -534,6 +578,26 @@ export function createOrchestratorWakeScheduler(
     pendingStoppedRecoveries.delete(sessionID);
   }
 
+  function suppressArchivedSession(sessionID: string): void {
+    const state = touchLocal(sessionID);
+    clearTimer(state);
+    bumpGeneration(state);
+    state.continuousIdle = false;
+    state.archived = true;
+    releaseLocalWakeOwner(sessionID);
+  }
+
+  function restoreArchivedSession(sessionID: string): void {
+    const state = localSessions.get(sessionID);
+    if (!state?.archived) return;
+    clearTimer(state);
+    bumpGeneration(state);
+    state.continuousIdle = false;
+    state.archived = false;
+    releaseLocalWakeOwner(sessionID);
+    rearmWakeProgress(sessionID);
+  }
+
   /**
    * Suppress scheduling without dropping process-global progress.
    * Used for input waits and temporary blocks.
@@ -567,6 +631,7 @@ export function createOrchestratorWakeScheduler(
     if (!enabled) return false;
     if (!capabilities.ready) return false;
     if (!options.shouldManageSession(sessionID)) return false;
+    if (localSessions.get(sessionID)?.archived) return false;
     if (options.hasInputWait(sessionID)) return false;
     if (options.isFallbackInProgress?.(sessionID)) return false;
     if (getWakeProgress(sessionID).stopped) return false;
@@ -590,19 +655,33 @@ export function createOrchestratorWakeScheduler(
   }
 
   function beginContinuousIdle(sessionID: string): void {
+    const state = localSessions.get(sessionID);
+    if (state?.archived) {
+      if (
+        enabled &&
+        capabilities.ready &&
+        typeof sessionSdk.get === 'function'
+      ) {
+        void refreshArchivedSession(sessionID, state.generation);
+      }
+      return;
+    }
     if (!canSchedule(sessionID)) return;
-    const state = touchLocal(sessionID);
-    if (state.continuousIdle && state.timer !== undefined) return;
-    state.continuousIdle = true;
+    const idleState = touchLocal(sessionID);
+    if (idleState.continuousIdle && idleState.timer !== undefined) return;
+    idleState.continuousIdle = true;
     if (getWakeProgress(sessionID).stopped) return;
-    if (state.timer === undefined) schedule(sessionID);
+    if (idleState.timer === undefined) schedule(sessionID);
   }
 
-  /** Fail-soft session-model enrichment (v2 `get` is optional). */
-  async function readSessionModel(
-    sessionID: string,
-  ): Promise<ContinuationModelSelection | undefined> {
-    if (typeof sessionSdk?.get !== 'function') return undefined;
+  type SessionMetadata = {
+    model?: ContinuationModelSelection;
+    archiveState?: boolean;
+  };
+
+  /** Fail-soft session-model and archive-state enrichment. */
+  async function readSessionModel(sessionID: string): Promise<SessionMetadata> {
+    if (typeof sessionSdk?.get !== 'function') return {};
     try {
       const sessionResponse = await sessionSdk.get({
         path: { id: sessionID },
@@ -613,13 +692,54 @@ export function createOrchestratorWakeScheduler(
       const session = isObjectRecord(sessionResponse?.data)
         ? sessionResponse.data
         : undefined;
-      return parseContinuationModelSelection(
-        session ? (session as Record<string, unknown>).model : undefined,
-      );
+      return {
+        model: parseContinuationModelSelection(
+          session ? (session as Record<string, unknown>).model : undefined,
+        ),
+        archiveState: readSessionArchiveState(session),
+      };
     } catch {
-      // Model enrichment is fail-soft.
-      return undefined;
+      // Model and archive enrichment are fail-soft; lifecycle events remain
+      // the v2 source when session.get is unavailable or fails.
+      return {};
     }
+  }
+
+  async function refreshArchivedSession(
+    sessionID: string,
+    generation: symbol,
+  ): Promise<void> {
+    const { archiveState } = await readSessionModel(sessionID);
+    const state = localSessions.get(sessionID);
+    if (
+      !state ||
+      state.generation !== generation ||
+      !state.archived ||
+      archiveState !== false
+    ) {
+      return;
+    }
+    restoreArchivedSession(sessionID);
+  }
+
+  function applyArchiveState(
+    sessionID: string,
+    state: LocalSessionState,
+    archiveState: boolean | undefined,
+  ): boolean {
+    if (state.archived) {
+      if (archiveState === false) {
+        restoreArchivedSession(sessionID);
+      } else {
+        suppressArchivedSession(sessionID);
+      }
+      return true;
+    }
+    if (archiveState === true) {
+      suppressArchivedSession(sessionID);
+      return true;
+    }
+    return false;
   }
 
   async function readHostSnapshot(
@@ -669,7 +789,7 @@ export function createOrchestratorWakeScheduler(
       return undefined;
     }
 
-    const model = await readSessionModel(sessionID);
+    const { model, archiveState } = await readSessionModel(sessionID);
 
     return {
       kind: 'todo',
@@ -677,6 +797,7 @@ export function createOrchestratorWakeScheduler(
       children: children as Array<Record<string, unknown>>,
       status,
       model,
+      archiveState,
     };
   }
 
@@ -765,9 +886,15 @@ export function createOrchestratorWakeScheduler(
       (child) => child.directory === undefined || child.directory === directory,
     );
 
-    const model = await readSessionModel(sessionID);
+    const { model, archiveState } = await readSessionModel(sessionID);
 
-    return { kind: 'children', children, hostParentActive, model };
+    return {
+      kind: 'children',
+      children,
+      hostParentActive,
+      model,
+      archiveState,
+    };
   }
 
   /** Active-child check for children-driven mode (see isWakeChildActive). */
@@ -870,6 +997,7 @@ export function createOrchestratorWakeScheduler(
     const state = localSessions.get(sessionID);
     if (!state || state.generation !== generation) return;
     if (!state.continuousIdle) return;
+    if (state.archived) return;
     if (!canSchedule(sessionID)) {
       suppress(sessionID);
       return;
@@ -898,6 +1026,7 @@ export function createOrchestratorWakeScheduler(
           : await readHostSnapshot(sessionID);
       if (!snapshot || state.generation !== generation) return;
       if (!state.continuousIdle) return;
+      if (applyArchiveState(sessionID, state, snapshot.archiveState)) return;
       if (!canSchedule(sessionID)) {
         suppress(sessionID);
         return;
@@ -933,6 +1062,7 @@ export function createOrchestratorWakeScheduler(
           : await readHostSnapshot(sessionID);
       if (!latest || state.generation !== generation) return;
       if (!state.continuousIdle) return;
+      if (applyArchiveState(sessionID, state, latest.archiveState)) return;
       if (!canSchedule(sessionID)) {
         suppress(sessionID);
         return;
@@ -964,6 +1094,7 @@ export function createOrchestratorWakeScheduler(
 
       // Reserve before promptAsync so a failed call cannot storm retries and
       // concurrent hook instances cannot double-wake.
+      if (applyArchiveState(sessionID, state, latest.archiveState)) return;
       if (!commitWakeReservation(sessionID, owner, latestFingerprint)) {
         return;
       }
@@ -1101,6 +1232,10 @@ export function createOrchestratorWakeScheduler(
     ) {
       return;
     }
+    if (localSessions.get(sessionID)?.archived) {
+      pendingStoppedRecoveries.add(sessionID);
+      return;
+    }
     pendingStoppedRecoveries.add(sessionID);
     rearmWakeProgress(sessionID);
     if (!canSchedule(sessionID)) return;
@@ -1115,15 +1250,23 @@ export function createOrchestratorWakeScheduler(
   async function event(input: {
     event: {
       type: string;
-      properties?: {
-        info?: { id?: string; parentID?: string };
-        sessionID?: string;
-        parentID?: string;
-        status?: { type?: string };
-      };
+      properties?: unknown;
+      data?: unknown;
     };
   }): Promise<void> {
-    const { type, properties } = input.event;
+    const { type } = input.event;
+    const properties = (
+      isObjectRecord(input.event.data)
+        ? input.event.data
+        : isObjectRecord(input.event.properties)
+          ? input.event.properties
+          : {}
+    ) as {
+      info?: { id?: string; parentID?: string; time?: unknown };
+      sessionID?: string;
+      parentID?: string;
+      status?: { type?: string };
+    };
 
     if (type === 'server.instance.disposed') {
       disposed = true;
@@ -1142,6 +1285,18 @@ export function createOrchestratorWakeScheduler(
 
     const sessionID = extractSessionID(input.event);
     if (!sessionID) return;
+
+    if (type === 'session.updated') {
+      if (options.shouldManageSession(sessionID)) {
+        const archiveState = readEventArchiveState(input.event);
+        if (archiveState === true) {
+          suppressArchivedSession(sessionID);
+        } else if (archiveState === false) {
+          restoreArchivedSession(sessionID);
+        }
+      }
+      return;
+    }
 
     // Event bookkeeping (children-driven mode + parent-active race guard).
     // Status tracking covers ALL sessions: child entries feed the busy-set
@@ -1179,7 +1334,11 @@ export function createOrchestratorWakeScheduler(
       if (options.shouldManageSession(sessionID)) {
         clearExpectingWakeBusy(sessionID);
         if (pendingStoppedRecoveries.has(sessionID)) {
-          triggerStoppedJobRecovery(sessionID);
+          if (localSessions.get(sessionID)?.archived) {
+            beginContinuousIdle(sessionID);
+          } else {
+            triggerStoppedJobRecovery(sessionID);
+          }
           return;
         }
         beginContinuousIdle(sessionID);
