@@ -79,7 +79,7 @@ const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
   readContextMinLines: DEFAULT_READ_CONTEXT_MIN_LINES,
   readContextMaxFiles: DEFAULT_READ_CONTEXT_MAX_FILES,
   maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
-  orchestratorWake: { enabled: true, intervalMs: 300_000 },
+  orchestratorWake: { enabled: true, intervalMs: 300_000, mode: 'auto' },
   wallClockTimeoutMs: 0,
   abortGraceMs: 10_000,
   concurrency: {

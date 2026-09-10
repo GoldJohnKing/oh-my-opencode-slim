@@ -1115,9 +1115,10 @@
         "orchestratorWake": {
           "default": {
             "enabled": true,
-            "intervalMs": 300000
+            "intervalMs": 300000,
+            "mode": "auto"
           },
-          "description": "Periodic orchestrator wake scheduler for idle sessions with incomplete todos. Default enabled at a 5-minute interval. Requires host session APIs (session.get, todo, children, status, promptAsync); inactive on the v2 shim.",
+          "description": "Periodic orchestrator wake scheduler for idle sessions. v1: requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. v2: runs in children-driven degraded mode (requires session.list + promptAsync) and wakes while un-finished child sessions remain. Default enabled at a 5-minute interval.",
           "type": "object",
           "properties": {
             "enabled": {
@@ -1131,6 +1132,16 @@
               "type": "integer",
               "minimum": 60000,
               "maximum": 2147483647
+            },
+            "mode": {
+              "default": "auto",
+              "description": "Wake-condition source. \"auto\" uses todo-gating on v1 hosts and children-driven degraded mode on v2 hosts (no todo surface there); \"todo\" or \"children\" pin one mode, degrading to children when the host lacks the todo API. Default \"auto\".",
+              "type": "string",
+              "enum": [
+                "auto",
+                "todo",
+                "children"
+              ]
             }
           }
         },

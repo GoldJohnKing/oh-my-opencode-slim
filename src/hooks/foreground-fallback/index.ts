@@ -18,6 +18,7 @@
  */
 
 import type { PluginInput } from '@opencode-ai/plugin';
+import { isRecord } from '../../utils/guards';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { log } from '../../utils/logger';
 import { getClient } from '../../utils/opencode-client';
@@ -278,6 +279,16 @@ const FALLBACK_IN_PROGRESS_KEY = Symbol.for(
   'oh-my-opencode-slim.foreground-fallback.in-progress',
 );
 
+/** Error name stamped by the v2 client shim's promptAsync when the host
+ * provides no session.switchModel while the replay declared
+ * `modelSwitch: 'required'`. Duck-typed by name (mirroring the hostFlavor
+ * convention) so this v1 hook stays decoupled from the v2 adapter module. */
+const V2_SWITCH_MODEL_UNAVAILABLE_ERROR = 'V2SwitchModelUnavailableError';
+
+function isSwitchModelUnavailableError(err: unknown): err is Error {
+  return err instanceof Error && err.name === V2_SWITCH_MODEL_UNAVAILABLE_ERROR;
+}
+
 function getProcessFallbacksInProgress(): Set<string> {
   const globalWithStore = globalThis as typeof globalThis & {
     [FALLBACK_IN_PROGRESS_KEY]?: Set<string>;
@@ -316,7 +327,10 @@ export class ForegroundFallbackManager {
   private readonly sessionRetries = new Map<string, number>();
   /** sessionID -> pending initial delay timeout handle.
    *  Cleared on recovery or session deletion. */
-  private readonly pendingInitialDelay = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pendingInitialDelay = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
   /** sessionID -> timestamp of last fallback attempt.
    *  Used to enforce retryDelayMs between consecutive attempts. */
   private readonly lastFallbackTime = new Map<string, number>();
@@ -616,7 +630,10 @@ export class ForegroundFallbackManager {
 
   /** Intervene immediately on first occurrence (tried === 0), otherwise
    *  delegate to retry budget. Used by all three event paths. */
-  private shouldTriggerFallback(sessionID: string, needsAbort = false): boolean {
+  private shouldTriggerFallback(
+    sessionID: string,
+    needsAbort = false,
+  ): boolean {
     const tried = this.sessionRetries.get(sessionID) ?? 0;
     if (tried === 0) {
       if (this.initialRetryDelayMs > 0) {
@@ -904,12 +921,24 @@ export class ForegroundFallbackManager {
         log('[foreground-fallback] promptAsync unavailable', { sessionID });
         return;
       }
+      // Loose alias: the v2 client shim accepts extra top-level args
+      // (`modelSwitch`) the way orchestrator-wake passes `delivery`.
+      const promptAsync = sessionClient.promptAsync as (
+        args: Record<string, unknown> & { modelSwitch?: 'required' },
+      ) => Promise<unknown>;
 
       const replayParts = partsFromReplayMessage(lastUser) as Array<{
         type: 'text';
         text: string;
       }>;
 
+      // v2-only flag (consumed by the client shim): the replay's model is
+      // the fallback TARGET, so a v2 host without session.switchModel must
+      // reject the replay (typed error) instead of silently replaying on
+      // the model that just failed. v1 call bytes stay untouched.
+      const isV2Host =
+        (this.input as PluginInput & { hostFlavor?: string }).hostFlavor ===
+        'v2';
       const promptBody = {
         path: { id: sessionID },
         body: {
@@ -922,19 +951,40 @@ export class ForegroundFallbackManager {
           model: ref,
           ...(agentName ? { agent: agentName } : {}),
         },
+        ...(isV2Host ? { modelSwitch: 'required' as const } : {}),
       };
 
+      let promptResult: unknown;
       try {
-        await sessionClient.promptAsync(promptBody);
-      } catch (_promptErr) {
+        promptResult = await promptAsync(promptBody);
+      } catch (promptErr) {
+        if (isSwitchModelUnavailableError(promptErr)) {
+          // Not a busy session — the host cannot switch models at all, so
+          // aborting and retrying cannot help (same missing capability on
+          // every attempt). Surface the real cause via the outer handler.
+          throw promptErr;
+        }
         log('[foreground-fallback] promptAsync on busy session, aborting', {
           sessionID,
         });
         await abortSessionWithTimeout(getClient(this.input), sessionID);
         await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
-        await sessionClient.promptAsync(promptBody);
+        promptResult = await promptAsync(promptBody);
       }
 
+      // v2 shim truthfulness: when the replay was delivered on the CURRENT
+      // model (session.switchModel failed mid-replay, `switched: false`),
+      // the switch claim must not be recorded — sessionModel feeds chain
+      // descent and onSessionModelChanged migrates provider accounting;
+      // both would lie. v1 results carry no `switched` key and keep the
+      // claim (v1 parity).
+      if (isRecord(promptResult) && promptResult.switched === false) {
+        log(
+          '[foreground-fallback] fallback prompt delivered on the current model (model switch failed)',
+          { sessionID, agentName, from: currentModel, intended: nextModel },
+        );
+        return;
+      }
       this.sessionModel.set(sessionID, nextModel);
       this.onSessionModelChanged?.(sessionID, nextModel);
       log('[foreground-fallback] switched to fallback model', {

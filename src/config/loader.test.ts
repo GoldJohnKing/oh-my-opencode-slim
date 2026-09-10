@@ -674,6 +674,7 @@ describe('onWarning callback', () => {
     expect(config.backgroundJobs?.orchestratorWake).toEqual({
       enabled: false,
       intervalMs: 120_000,
+      mode: 'auto',
     });
     expect(config.backgroundJobs).not.toHaveProperty('continueOnIdle');
     expect(config.autoUpdate).toBe(false);

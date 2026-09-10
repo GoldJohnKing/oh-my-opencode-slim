@@ -137,9 +137,11 @@ bun run build
 The same package runs on both OpenCode v1 and v2. On v2 you get the full
 agent pantheon, delegation through the host `subagent` tool (bridged into the
 background job board), all built-in tools and slash commands, auto-registered
-MCPs, `/preset` in the TUI, webfetch secondary-model summaries, and
-rate-limit model fallback. Multiplexer panes and the orchestrator-wake
-scheduler stay v1-only by design (v2 renders and notifies subagents natively).
+MCPs, `/preset` in the TUI, webfetch secondary-model summaries, rate-limit
+model fallback, and the orchestrator-wake scheduler in children-driven
+degraded mode (a periodic watchdog over stuck background children and
+unreconciled jobs). Multiplexer panes stay v1-only by design (v2 renders and
+notifies subagents natively).
 
 v2 auto-refreshes unpinned plugins on startup, so pin an exact version while
 both v2 and this adapter evolve quickly:

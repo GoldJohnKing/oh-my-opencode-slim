@@ -28,6 +28,7 @@ export { createJsonErrorRecoveryHook } from './json-error-recovery/hook';
 export { createLoopCommandHook } from './loop-command';
 export {
   createOrchestratorWakeScheduler,
+  ORCHESTRATOR_CHILDREN_WAKE_TEXT,
   ORCHESTRATOR_WAKE_TEXT,
   ORCHESTRATOR_WAKE_UNCHANGED_CAP,
 } from './orchestrator-wake';
