@@ -198,7 +198,7 @@ describe('PluginConfigSchema backgroundJobs', () => {
     }
   });
 
-  it('defaults orchestratorWake to enabled with a 5-minute interval', () => {
+  it('defaults orchestratorWake to enabled with a 5-minute interval and auto mode', () => {
     const result = PluginConfigSchema.safeParse({ backgroundJobs: {} });
 
     expect(result.success).toBe(true);
@@ -206,6 +206,7 @@ describe('PluginConfigSchema backgroundJobs', () => {
       expect(result.data.backgroundJobs?.orchestratorWake).toEqual({
         enabled: true,
         intervalMs: 300_000,
+        mode: 'auto',
       });
     }
   });
@@ -222,7 +223,30 @@ describe('PluginConfigSchema backgroundJobs', () => {
       expect(result.data.backgroundJobs?.orchestratorWake).toEqual({
         enabled: false,
         intervalMs: 120_000,
+        mode: 'auto',
       });
+    }
+  });
+
+  it('accepts explicit orchestratorWake.mode values', () => {
+    for (const mode of ['auto', 'todo', 'children'] as const) {
+      const result = PluginConfigSchema.safeParse({
+        backgroundJobs: { orchestratorWake: { mode } },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.backgroundJobs?.orchestratorWake?.mode).toBe(mode);
+      }
+    }
+  });
+
+  it('rejects unknown orchestratorWake.mode values', () => {
+    for (const mode of ['child', 'todos', 'AUTO', '', null]) {
+      expect(
+        PluginConfigSchema.safeParse({
+          backgroundJobs: { orchestratorWake: { mode } },
+        }).success,
+      ).toBe(false);
     }
   });
 

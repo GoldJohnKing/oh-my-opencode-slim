@@ -359,15 +359,19 @@ periodic internal wake prompt so incomplete TODOs are not abandoned. This is
   "backgroundJobs": {
     "orchestratorWake": {
       "enabled": true,
-      "intervalMs": 300000
+      "intervalMs": 300000,
+      "mode": "auto"
     }
   }
 }
 ```
 
 `intervalMs` must be an integer from `60000` to `2147483647`. `0` is invalid.
-Set `enabled: false` to disable wakes while keeping idle reconciliation and
-background-job orchestration.
+`mode` selects the wake condition: `"auto"` (default) uses todo-gating on v1
+hosts and children-driven mode on v2 hosts; `"todo"` and `"children"` pin one
+mode (an explicit `"todo"` degrades to children on hosts without the todo
+API). Set `enabled: false` to disable wakes while keeping idle reconciliation
+and background-job orchestration.
 
 Behavior:
 
@@ -406,8 +410,20 @@ The scheduler does **not** perform automatic cancellation and does not rely on
 the local job board. When no incomplete TODOs remain, it ends the current idle
 spell and stops polling until new activity.
 
-**v2 availability:** the v2 shim lacks the required session APIs, so this
-capability-gated feature remains inactive there.
+**v2 hosts (children-driven degraded mode):** v2 has no todo/children/status
+surfaces, so with `mode: "auto"` the scheduler runs in children-driven mode.
+The wake condition becomes "children without a terminal `outcome`" — v2
+records an outcome (succeeded|failed|interrupted) only on terminal transition —
+plus pending stopped-job recovery. Children are enumerated via
+`session.list({parentID})` (event-tracked fallback from `session.created`
+links when the listing is unavailable), scoped to the session's directory, and
+a child with no fresh update evidence (host `time.updated` or a tracked status
+change within 3× the interval) counts as inactive. The wake prompt asks the
+orchestrator to check on unfinished background child sessions and unreconciled
+jobs, is delivered with `queue` semantics (like v1's queued prompt_async), and
+the children-only fingerprint keeps the two-wake no-progress cap bounding
+cost. v2's native subagent completion nudges still cover the happy path; this
+watchdog covers stuck children and unreconciled jobs.
 
 For external manual work, the orchestrator first gives the user concrete steps,
 then calls `wait_for_user` as its final tool action. This explicit signal covers

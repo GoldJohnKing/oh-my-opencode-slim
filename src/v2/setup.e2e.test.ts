@@ -30,6 +30,7 @@ import type { V2Context } from './types';
 
 type CapturedTool = {
   name: string;
+  options?: { codemode?: boolean };
   execute: (input: unknown, context: unknown) => Promise<unknown>;
 };
 
@@ -314,6 +315,13 @@ describe('createV2Setup e2e', () => {
     expect(calls.agentUpdates.map((u) => u.id)).toContain('orchestrator');
     expect(calls.agentDefault).toBe('orchestrator');
     expect(calls.toolAdds.length).toBeGreaterThan(0);
+    // CodeMode split (upstream Tool.snapshot): every registered tool must
+    // carry `options: { codemode: false }` or it never becomes a direct
+    // model-visible tool definition — it lands in the `execute` tool's
+    // confined JS runtime and session catalogs yield `Unknown tool: ...`.
+    for (const tool of calls.toolAdds) {
+      expect(tool.options).toEqual({ codemode: false });
+    }
     expect(calls.commandAdds.map((c) => c.name)).toContain('deepwork');
     expect(calls.mcpSets.map((m) => m.name)).toEqual(['context7', 'gh_grep']);
     expect(calls.mcpSets.map((m) => m.config)).toEqual([
@@ -321,6 +329,7 @@ describe('createV2Setup e2e', () => {
       expect.objectContaining({ type: 'remote' }),
     ]);
     expect(calls.hooks).toContain('session:context');
+    expect(calls.hooks).toContain('session:prompt');
     expect(calls.hooks).toContain('tool:execute.before');
     expect(calls.hooks).toContain('tool:execute.after');
     expect(calls.contextHookCb).toBeFunction();
@@ -484,5 +493,20 @@ describe('createV2Setup e2e', () => {
     ).length;
     expect(bustWarningsAfter).toBe(bustWarningsAtDispose);
     expect(logAfterDispose).not.toContain('ses_after');
+  }, 20_000);
+
+  test('dispose runs the v1 dispose hook (server.instance.disposed synthesis for wake timers)', async () => {
+    const { ctx } = makeMockV2Context(projectDir);
+    const cleanup = await createV2Setup()(ctx);
+    await cleanup();
+    await flushLoggerForTesting();
+
+    // The v1 dispose hook synthesizes `server.instance.disposed` into the
+    // v1 event consumers — orchestrator-wake scheduler timers/state,
+    // task-session manager. Without this wiring, host teardown would leak
+    // the scheduler's unref'd wake timers.
+    const logText = readPluginLog();
+    expect(logText).toContain('[v2] v1 dispose hook invoked');
+    expect(logText).not.toContain('[v2] v1 dispose failed');
   }, 20_000);
 });

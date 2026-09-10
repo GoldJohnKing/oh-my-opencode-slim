@@ -146,6 +146,111 @@ describe('v2 client shim delegation', () => {
     });
   });
 
+  test('promptAsync threads an optional queue delivery (orchestrator-wake) and keeps switchModel ordering', async () => {
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const input = buildPluginInput(
+      makeCtx({
+        switchModel: async (i: unknown) => {
+          seq.push({ m: 'switchModel', i });
+        },
+        prompt: async (i: unknown) => {
+          seq.push({ m: 'prompt', i });
+          return {};
+        },
+      } as never),
+    );
+    const promptAsync = (
+      input.client as {
+        session: {
+          promptAsync: (
+            a: Record<string, unknown> & { delivery?: 'steer' | 'queue' },
+          ) => Promise<unknown>;
+        };
+      }
+    ).session.promptAsync;
+    // Wake call shape: model selection + delivery 'queue'.
+    await promptAsync({
+      path: { id: 'ses_1' },
+      query: { directory: '/proj' },
+      body: {
+        agent: 'orchestrator',
+        model: { providerID: 'test', modelID: 'model-a' },
+        parts: [{ type: 'text', text: 'wake reminder' }],
+      },
+      delivery: 'queue',
+      throwOnError: true,
+    });
+    expect(seq).toHaveLength(2);
+    expect(seq[0]).toMatchObject({ m: 'switchModel' });
+    expect(seq[1]).toMatchObject({
+      m: 'prompt',
+      i: { sessionID: 'ses_1', delivery: 'queue', text: 'wake reminder' },
+    });
+    // Regression: without the delivery argument the default stays 'steer'
+    // (foreground-fallback depends on steering an in-flight run).
+    await promptAsync({
+      path: { id: 'ses_1' },
+      body: { parts: [{ type: 'text', text: 'fallback replay' }] },
+    });
+    expect(seq[2]).toMatchObject({
+      m: 'prompt',
+      i: { sessionID: 'ses_1', delivery: 'steer', text: 'fallback replay' },
+    });
+  });
+
+  test('promptAsync carries the internal-initiator marker as prompt metadata (wake cap survival)', async () => {
+    // The v1 wake prompt's part metadata cannot survive the text-only v2
+    // translation; the marker must travel as prompt `metadata` (accepted
+    // and propagated by the v2 session.prompt endpoint + hook) so the
+    // session-prompt bridge can restore it and observeChatMessage does
+    // NOT classify the wake admission as external user activity.
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const input = buildPluginInput(
+      makeCtx({
+        prompt: async (i: unknown) => {
+          seq.push({ m: 'prompt', i });
+          return {};
+        },
+      } as never),
+    );
+    const promptAsync = (
+      input.client as {
+        session: {
+          promptAsync: (
+            a: Record<string, unknown> & { delivery?: 'steer' | 'queue' },
+          ) => Promise<unknown>;
+        };
+      }
+    ).session.promptAsync;
+    // Internal wake prompt (real ORCHESTRATOR_CHILDREN_WAKE_TEXT part shape).
+    await promptAsync({
+      path: { id: 'ses_1' },
+      body: {
+        agent: 'orchestrator',
+        parts: [createInternalAgentTextPart('wake reminder')],
+      },
+      delivery: 'queue',
+      throwOnError: true,
+    });
+    expect(seq[0]).toMatchObject({
+      m: 'prompt',
+      i: {
+        sessionID: 'ses_1',
+        delivery: 'queue',
+        metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+      },
+    });
+    expect((seq[0].i as { text: string }).text).toContain(
+      'SLIM_INTERNAL_INITIATOR',
+    );
+    // Plain external prompts carry no metadata key.
+    await promptAsync({
+      path: { id: 'ses_1' },
+      body: { parts: [{ type: 'text', text: 'user says hi' }] },
+    });
+    expect(seq[1].i).not.toHaveProperty('metadata');
+  });
+
   test('abort delegates to interrupt', async () => {
     const calls: unknown[] = [];
     const input = buildPluginInput(
@@ -183,6 +288,168 @@ describe('v2 client shim delegation', () => {
     ).session.get({ path: { id: 'ses_1' }, query: { directory: '/proj' } });
     expect(calls).toEqual([{ sessionID: 'ses_1' }]);
     expect(res.data).toEqual({ id: 'ses_1', parentID: 'ses_0', title: 't' });
+  });
+
+  test('delete delegates to session.remove with the flat {sessionID}', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        remove: async (i: { sessionID: string }) => {
+          calls.push(i);
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: { delete: (a: unknown) => Promise<unknown> };
+      }
+    ).session.delete({ path: { id: 'ses_tmp' }, query: { directory: '/d' } });
+    // The smartfetch secondary-model cleanup shape (path.id) must resolve
+    // to the flat v2 {sessionID} — no temp-session leak.
+    expect(calls).toEqual([{ sessionID: 'ses_tmp' }]);
+  });
+
+  test('delete without remove resolves with an honest log (no fake throw)', async () => {
+    const input = buildPluginInput(makeCtx({}));
+    await expect(
+      (
+        input.client as {
+          session: { delete: (a: unknown) => Promise<unknown> };
+        }
+      ).session.delete({ path: { id: 'ses_tmp' } }),
+    ).resolves.toBeUndefined();
+  });
+
+  test('list delegates to session.list and maps to the v1 {data} envelope', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        list: async (i: unknown) => {
+          calls.push(i);
+          return {
+            data: [
+              {
+                id: 'ses_1',
+                parentID: 'ses_0',
+                projectID: 'proj_1',
+                title: 'Interview thing',
+                time: { created: 1, updated: 2, idle: 3 },
+                location: { directory: '/w/alpha' },
+                agent: 'orchestrator',
+              },
+              { id: 'ses_2', time: { created: 5 } },
+            ],
+            cursor: {},
+          };
+        },
+      } as never),
+    );
+    const res = await (
+      input.client as {
+        session: {
+          list: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.list({ query: {} });
+    expect(calls).toEqual([{}]);
+    // v1-shape mapping the interview dashboard reads: directory (from v2
+    // location.ref) + time.updated for the scan cutoff; identity fields
+    // pass through, nothing fabricated.
+    expect(res.data).toEqual([
+      {
+        id: 'ses_1',
+        parentID: 'ses_0',
+        projectID: 'proj_1',
+        title: 'Interview thing',
+        agent: 'orchestrator',
+        directory: '/w/alpha',
+        time: { created: 1, updated: 2, idle: 3 },
+      },
+      { id: 'ses_2', time: { created: 5 } },
+    ]);
+  });
+
+  test('list maps terminal outcome for the wake scheduler children view', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        list: async () => ({
+          data: [
+            {
+              id: 'kid_active',
+              parentID: 'ses_0',
+              time: { updated: 10 },
+              location: { directory: '/proj' },
+            },
+            {
+              id: 'kid_done',
+              parentID: 'ses_0',
+              outcome: 'succeeded',
+              time: { updated: 20 },
+              location: { directory: '/proj' },
+            },
+          ],
+        }),
+      } as never),
+    );
+    const res = await (
+      input.client as {
+        session: { list: (a: unknown) => Promise<{ data: unknown[] }> };
+      }
+    ).session.list({ query: { parentID: 'ses_0' } });
+    expect(res.data).toEqual([
+      {
+        id: 'kid_active',
+        parentID: 'ses_0',
+        directory: '/proj',
+        time: { updated: 10 },
+        // outcome intentionally absent until terminal transition
+      },
+      {
+        id: 'kid_done',
+        parentID: 'ses_0',
+        outcome: 'succeeded',
+        directory: '/proj',
+        time: { updated: 20 },
+      },
+    ]);
+  });
+
+  test('list passes through directory and parentID filters (null → "null")', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        list: async (i: unknown) => {
+          calls.push(i);
+          return { data: [] };
+        },
+      } as never),
+    );
+    const list = (
+      input.client as {
+        session: { list: (a: unknown) => Promise<{ data: unknown[] }> };
+      }
+    ).session.list;
+    await list({ query: { directory: '/w' } });
+    await list({ query: { parentID: 'ses_parent' } });
+    await list({ query: { parentID: null } });
+    await list({ query: { parentID: 'null' } });
+    expect(calls).toEqual([
+      { directory: '/w' },
+      { parentID: 'ses_parent' },
+      { parentID: 'null' }, // root-only sentinel on the wire
+      { parentID: 'null' },
+    ]);
+  });
+
+  test('list without session.list keeps the v1-parity empty page', async () => {
+    const input = buildPluginInput(makeCtx({}));
+    await expect(
+      (
+        input.client as {
+          session: { list: (a: unknown) => Promise<{ data: unknown[] }> };
+        }
+      ).session.list({ query: {} }),
+    ).resolves.toEqual({ data: [] });
   });
 
   test('unavailable methods fail explicitly, never fake success', async () => {

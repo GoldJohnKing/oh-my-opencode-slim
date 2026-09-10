@@ -6,6 +6,7 @@ import {
   hasTaggedPart,
   isTaggedPart,
   isVolatileTaggedMessage,
+  setDefaultSyntheticPartCacheHint,
   stripTaggedContent,
 } from './cache-safe-injection';
 import type { MessageWithParts } from './types';
@@ -33,6 +34,72 @@ describe('createTaggedSyntheticPart', () => {
       text: 'hello',
       metadata: { other: 1, [KEY]: true },
     });
+  });
+
+  test('omits cache entirely when neither spec nor default provides it (v1 bytes)', () => {
+    const part = createTaggedSyntheticPart({
+      text: 'hello',
+      metadataKey: KEY,
+    });
+    expect(part).toEqual({
+      type: 'text',
+      synthetic: true,
+      text: 'hello',
+      metadata: { [KEY]: true },
+    });
+    expect('cache' in part).toBe(false);
+  });
+
+  test('copies an explicit spec cache hint (ttl included when set)', () => {
+    const part = createTaggedSyntheticPart({
+      text: 'hello',
+      metadataKey: KEY,
+      cache: { type: 'ephemeral' },
+    });
+    expect(part.cache).toEqual({ type: 'ephemeral' });
+
+    const ttl = createTaggedSyntheticPart({
+      text: 'hello',
+      metadataKey: KEY,
+      cache: { type: 'persistent', ttlSeconds: 300 },
+    });
+    expect(ttl.cache).toEqual({ type: 'persistent', ttlSeconds: 300 });
+  });
+
+  test('scoped default applies while set and restores after', () => {
+    const restore = setDefaultSyntheticPartCacheHint({ type: 'ephemeral' });
+    try {
+      const inside = createTaggedSyntheticPart({
+        text: 'hello',
+        metadataKey: KEY,
+      });
+      expect(inside.cache).toEqual({ type: 'ephemeral' });
+      // An explicit spec hint always wins over the default.
+      const explicit = createTaggedSyntheticPart({
+        text: 'hello',
+        metadataKey: KEY,
+        cache: { type: 'persistent' },
+      });
+      expect(explicit.cache).toEqual({ type: 'persistent' });
+    } finally {
+      restore();
+    }
+    const outside = createTaggedSyntheticPart({
+      text: 'hello',
+      metadataKey: KEY,
+    });
+    expect('cache' in outside).toBe(false);
+  });
+
+  test('the created hint is a copy, not a shared reference', () => {
+    const hint = { type: 'ephemeral' as const };
+    const part = createTaggedSyntheticPart({
+      text: 'hello',
+      metadataKey: KEY,
+      cache: hint,
+    });
+    expect(part.cache).not.toBe(hint);
+    expect(part.cache).toEqual(hint);
   });
 });
 

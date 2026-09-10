@@ -32,6 +32,16 @@ import {
   type MessageWithParts,
 } from './types';
 
+/**
+ * Cache hint mirrored from the v2 LLM `ContentPart.cache` (`LLM.CacheHint`).
+ * Honored by anthropic-messages / google-vertex / bedrock-converse /
+ * openrouter as a manual cache-breakpoint placement; a no-op elsewhere.
+ */
+export interface SyntheticPartCacheHint {
+  type: 'ephemeral' | 'persistent';
+  ttlSeconds?: number;
+}
+
 export interface TaggedSyntheticPartSpec {
   /** Text content of the injected part. */
   text: string;
@@ -42,17 +52,60 @@ export interface TaggedSyntheticPartSpec {
   metadataKey: string;
   /** Additional metadata merged into the part (the tag key always wins). */
   extraMetadata?: Record<string, unknown>;
+  /**
+   * Optional cache hint copied onto the created part. v1 callers never
+   * pass it, so the v1 payload stays byte-identical; the v2 context
+   * bridge scopes a process default via `setDefaultSyntheticPartCacheHint`
+   * so every part injected on v2 carries it.
+   */
+  cache?: SyntheticPartCacheHint;
+}
+
+/**
+ * Current scoped default applied to parts whose spec omits `cache`.
+ * ONLY the v2 context bridge may set it (set → run bridged transform →
+ * restore); the v1 pipeline never executes inside that wrapper, so v1
+ * bytes never change.
+ */
+let currentDefaultCacheHint: SyntheticPartCacheHint | undefined;
+
+/**
+ * Set the scoped default cache hint for parts created while the returned
+ * restore function has not been called. Returns a restore closure that
+ * reinstates the previous default (call it in a `finally`).
+ */
+export function setDefaultSyntheticPartCacheHint(
+  hint: SyntheticPartCacheHint | undefined,
+): () => void {
+  const previous = currentDefaultCacheHint;
+  currentDefaultCacheHint = hint;
+  return () => {
+    currentDefaultCacheHint = previous;
+  };
 }
 
 /** Build a synthetic text part tagged with the given metadata key. */
 export function createTaggedSyntheticPart(
   spec: TaggedSyntheticPartSpec,
 ): MessagePart {
+  const cache = spec.cache ?? currentDefaultCacheHint;
   return {
     type: 'text',
     synthetic: true,
     text: spec.text,
     metadata: { ...(spec.extraMetadata ?? {}), [spec.metadataKey]: true },
+    // Copied (never shared) so later mutation of the spec/default cannot
+    // drift an already-created part.
+    ...(cache
+      ? {
+          cache: {
+            type: cache.type,
+            ...(cache.ttlSeconds !== undefined
+              ? { ttlSeconds: cache.ttlSeconds }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 

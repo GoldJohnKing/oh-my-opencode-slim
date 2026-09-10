@@ -5,10 +5,10 @@
  * project metadata, and a shell. v2's plugin context exposes none of these,
  * so this shim builds a v1-shaped input whose `client` translates the v1
  * SDK call shapes (Hono-style `{path, body}` or flat `{sessionID}`) into
- * v2 flat session calls (`get`/`interrupt`/`switchModel`/`prompt`/
- * `context`). Delegation is real where the v2 host provides the method and
- * explicitly fails or degrades with a log where it does not — the shim
- * never fakes success shapes.
+ * v2 flat session calls (`get`/`remove`/`list`/`interrupt`/`switchModel`/
+ * `prompt`/`context`). Delegation is real where the v2 host provides the
+ * method and explicitly fails or degrades with a log where it does not —
+ * the shim never fakes success shapes.
  *
  * The v2 model-switch semantics (prompts carry no model; `switchModel`
  * must precede the prompt) are encapsulated in the `promptAsync`
@@ -16,6 +16,11 @@
  * unmodified on v2.
  */
 
+import { isRecord } from '../utils/guards';
+import {
+  INTERNAL_INITIATOR_METADATA_KEY,
+  isInternalInitiatorPart,
+} from '../utils/internal-initiator';
 import { log } from '../utils/logger';
 import type { V2Context } from './types';
 
@@ -119,6 +124,106 @@ function modelRefFromBody(body: {
   return id && providerID ? { id, providerID } : undefined;
 }
 
+/**
+ * Internal-initiator marker for v2 prompts: the v1 part metadata is lost
+ * in the text-only v2 translation, so the marker travels as prompt
+ * `metadata` (accepted and propagated by the v2 session.prompt endpoint
+ * and its hook). The session-prompt bridge restores it onto the rebuilt
+ * v1 parts view so `isInternalInitiatorPart` consumers — notably
+ * orchestrator-wake's `observeChatMessage`, which must NOT treat a wake
+ * admission as external user activity (the two-wake no-progress cap
+ * depends on that) — keep working on v2.
+ */
+function internalInitiatorMetadataFromBody(
+  args: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const body = (args?.body ?? {}) as {
+    parts?: Array<Record<string, unknown>>;
+  };
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  return parts.some((part) => isInternalInitiatorPart(part))
+    ? { [INTERNAL_INITIATOR_METADATA_KEY]: true }
+    : undefined;
+}
+
+/**
+ * Map one v2 `Session.Info` to the v1 list shape the shim's consumers
+ * read (interview dashboard directory discovery: `directory`,
+ * `time.updated`; identity fields for any future consumer). Only fields
+ * with the right type are copied — nothing is fabricated (no invented
+ * `version`/`title` defaults).
+ */
+function toV1SessionInfo(
+  info: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (typeof info.id === 'string') out.id = info.id;
+  if (typeof info.parentID === 'string') out.parentID = info.parentID;
+  if (typeof info.projectID === 'string') out.projectID = info.projectID;
+  if (typeof info.title === 'string') out.title = info.title;
+  if (typeof info.agent === 'string') out.agent = info.agent;
+  // v2 Session.Info.outcome appears only on terminal transition
+  // (succeeded|failed|interrupted); orchestrator-wake's children-driven
+  // mode reads it as the terminal signal.
+  if (typeof info.outcome === 'string') out.outcome = info.outcome;
+  if (isRecord(info.model)) out.model = info.model;
+  if (isRecord(info.metadata)) out.metadata = info.metadata;
+  // v2 carries the directory on `location` (Location.Ref); v1 had it flat.
+  if (isRecord(info.location)) {
+    if (typeof info.location.directory === 'string') {
+      out.directory = info.location.directory;
+    }
+  }
+  if (typeof info.directory === 'string') out.directory = info.directory;
+  if (isRecord(info.time)) {
+    const time: Record<string, unknown> = {};
+    if (typeof info.time.created === 'number') time.created = info.time.created;
+    if (typeof info.time.updated === 'number') time.updated = info.time.updated;
+    if (typeof info.time.idle === 'number') time.idle = info.time.idle;
+    if (Object.keys(time).length > 0) out.time = time;
+  }
+  return out;
+}
+
+/**
+ * v1 `client.session.list` over v2 `session.list`. Accepts the v1
+ * `{query}` call shape (or a flat query object); passes through the
+ * filters shim callers use — `directory` and the `parentID` filter
+ * (session id or root-only: the literal `"null"` string, with a real
+ * `null` normalized to it) — and wraps the mapped page in the v1
+ * `{data}` envelope. Hosts without `session.list` keep the v1-parity
+ * empty page (honest absence, not a fake success).
+ */
+export function createSessionListShim(
+  s: V2Context['session'],
+): (args: Record<string, unknown>) => Promise<{ data: unknown[] }> {
+  return async (args) => {
+    if (typeof s.list !== 'function') return { data: [] };
+    const query = ((args?.query as Record<string, unknown> | undefined) ??
+      (args as Record<string, unknown> | undefined) ??
+      {}) as Record<string, unknown>;
+    const input: Record<string, unknown> = {};
+    if (typeof query.directory === 'string' && query.directory) {
+      input.directory = query.directory;
+    }
+    if (query.parentID === null) {
+      input.parentID = 'null'; // root-only sentinel on the wire
+    } else if (typeof query.parentID === 'string' && query.parentID !== '') {
+      input.parentID = query.parentID;
+    }
+    const output = (await s.list(input)) as
+      | { data?: unknown }
+      | Array<Record<string, unknown>>
+      | undefined;
+    const infos = Array.isArray(output)
+      ? output
+      : isRecord(output) && Array.isArray(output.data)
+        ? (output.data as Array<Record<string, unknown>>)
+        : [];
+    return { data: infos.filter(isRecord).map(toV1SessionInfo) };
+  };
+}
+
 /** Build a v1-compatible PluginInput from the v2 context. The optional
  * `extras` threads probed v2 capabilities (e.g. one-shot generation)
  * through as `experimental_v2`; when absent no `experimental_v2` key is
@@ -170,7 +275,7 @@ export function buildPluginInput(
       // after the grace (false terminalization). With the method absent,
       // the lookup throws → snapshot.error → the reconciler's safe
       // markStatusUncertain branch.
-      list: async () => ({ data: [] }),
+      list: createSessionListShim(s),
       prompt: s.prompt
         ? async (args: Record<string, unknown>) => {
             const files = filesFromBody(args);
@@ -184,10 +289,17 @@ export function buildPluginInput(
         : async () => {
             throw new Error('[v2] session.prompt unavailable');
           },
-      promptAsync: async (args: Record<string, unknown>) => {
+      // v1 prompt_async QUEUED its prompt. The optional `delivery` argument
+      // lets callers preserve that on v2 ('queue' — orchestrator-wake);
+      // the default stays 'steer' because the foreground-fallback replay
+      // must steer an in-flight run.
+      promptAsync: async (
+        args: Record<string, unknown> & { delivery?: 'steer' | 'queue' },
+      ) => {
         if (!s.prompt) {
           throw new Error('[v2] session.prompt unavailable for promptAsync');
         }
+        const delivery = args?.delivery === 'queue' ? 'queue' : 'steer';
         const body = (args?.body ?? {}) as Parameters<
           typeof modelRefFromBody
         >[0] & { parts?: Array<{ type?: string; text?: string }> };
@@ -203,11 +315,13 @@ export function buildPluginInput(
           }
         }
         const files = filesFromBody(args);
+        const metadata = internalInitiatorMetadataFromBody(args);
         return s.prompt({
           sessionID: sessionIDOf(args),
           text: textFromBody(args),
-          delivery: 'steer',
+          delivery,
           ...(files.length > 0 ? { files } : {}),
+          ...(metadata ? { metadata } : {}),
         });
       },
       update: s.rename
@@ -223,11 +337,20 @@ export function buildPluginInput(
               id: sessionIDOf(args),
             });
           },
-      delete: async (args: Record<string, unknown>) => {
-        log('[v2][shim] session.delete unavailable (v2 has no delete)', {
-          id: sessionIDOf(args),
-        });
-      },
+      // v2 removed the delete endpoint in name only: `session.remove` is
+      // the same DELETE /api/session/:id. Capability-probed like `get`
+      // above — smartfetch's secondary-model cleanup (the real caller)
+      // relies on this to not leak temp sessions on v2. Hosts without
+      // `remove` degrade with the honest log below (no fake success).
+      delete: s.remove
+        ? async (args: Record<string, unknown>) => {
+            await s.remove?.({ sessionID: sessionIDOf(args) });
+          }
+        : async (args: Record<string, unknown>) => {
+            log('[v2][shim] session.remove unavailable; delete is a no-op', {
+              id: sessionIDOf(args),
+            });
+          },
     },
     app: {
       log: async (args?: Record<string, unknown>) => {

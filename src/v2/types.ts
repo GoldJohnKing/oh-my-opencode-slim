@@ -14,8 +14,29 @@ export interface V2AgentDraft {
   update(id: string, update: (agent: Record<string, unknown>) => void): void;
   remove(id: string): void;
 }
+/** v2 Tool.Options registration flags (upstream `Tool.Options` subset).
+ * `codemode: false` is the CodeMode opt-out: upstream `Tool.snapshot()`
+ * only promotes `codemode === false` tools to direct model-visible tool
+ * definitions — everything else is reachable only inside the `execute`
+ * tool's confined JS runtime, so session tool catalogs yield
+ * `Unknown tool: <name>` even though registration succeeded. The field
+ * is additive: older hosts ignore it. */
+export interface V2ToolOptions {
+  codemode?: boolean;
+  namespace?: string;
+  permission?: string;
+}
+/** v2 tool payload accepted by `tool.transform` drafts (the Tool.Info
+ * subset this adapter produces). */
+export interface V2ToolDefinition {
+  name: string;
+  description: string;
+  input: unknown;
+  options?: V2ToolOptions;
+  execute: (input: unknown, context: unknown) => Promise<unknown>;
+}
 export interface V2ToolDraft {
-  add(tool: Record<string, unknown>): void;
+  add(tool: V2ToolDefinition): void;
 }
 /** A v2 command definition passed to `command.transform` drafts. The command
  * body runs `execute` directly (no template field). */
@@ -47,8 +68,33 @@ export interface V2SessionContextEvent {
     id?: string;
     role: string;
     content: Array<Record<string, unknown>>;
+    /** Session identity on the message envelope. Live v2 hosts carry only
+     * `{id, time, text, type}` on transcript user messages; the v2 context
+     * bridge stamps these absence-gated so the bridged v1 injection gates
+     * (phase-reminder, board, nudge) keep working. */
+    sessionID?: string;
+    /** Agent that handled the message (same enrichment contract). */
+    agent?: string;
   }>;
   tools: Record<string, unknown>;
+}
+/**
+ * v2 `session.prompt` hook payload: fires ONCE per admitted input (endpoint
+ * prompts AND subagent-tool child prompts; synthetic/shell/compaction
+ * inputs skip it). `messageID` is the eventual inbox User id — the v1
+ * `chat.message` dedupe key.
+ */
+export interface V2SessionPromptEvent {
+  readonly sessionID: string;
+  readonly messageID: string;
+  prompt: {
+    text: string;
+    files?: Array<Record<string, unknown>>;
+    agents?: Array<Record<string, unknown>>;
+    skills?: Array<Record<string, unknown>>;
+  };
+  metadata?: Record<string, unknown>;
+  readonly delivery?: unknown;
 }
 export interface V2ToolBeforeEvent {
   readonly tool: string;
@@ -112,8 +158,24 @@ export interface V2Context {
       name: 'context',
       cb: (event: V2SessionContextEvent) => Promise<void>,
     ): Promise<V2Registration>;
+    /** v2 session.prompt hook — once per admitted input (see
+     * V2SessionPromptEvent). Older v2 hosts reject the name; callers must
+     * keep a fallback path. */
+    hook(
+      name: 'prompt',
+      cb: (event: V2SessionPromptEvent) => Promise<void>,
+    ): Promise<V2Registration>;
     /** v2 session.get — SessionInfo by id (runtime-probed). */
     get?(input: { sessionID: string }): Promise<unknown>;
+    /** v2 session.remove — DELETE /api/session/:id (runtime-probed). */
+    remove?(input: { sessionID: string }): Promise<unknown>;
+    /** v2 session.list — query-filtered listing (runtime-probed).
+     * `parentID` accepts a session id or `null`/the literal `"null"`
+     * string for root-only listing. */
+    list?(input: {
+      directory?: string;
+      parentID?: string | null;
+    }): Promise<unknown>;
     /** v2 session.interrupt — `continue: false` aborts the active run. */
     interrupt?(input: {
       sessionID: string;
@@ -132,8 +194,18 @@ export interface V2Context {
     /** v2 session.prompt — flat PromptInput ({sessionID, text, files?,
      * agents?, skills?, metadata?, delivery?, resume?}). */
     prompt?(input: Record<string, unknown>): Promise<unknown>;
-    /** v2 session.synthetic — like prompt but not persisted as user input. */
-    synthetic?(input: Record<string, unknown>): Promise<unknown>;
+    /** v2 session.synthetic — like prompt but not persisted as user
+     * input. `delivery` routes the inbox entry ("steer" | "queue");
+     * `resume: false` admits the input WITHOUT waking the session. */
+    synthetic?(input: {
+      sessionID: string;
+      id?: string;
+      text: string;
+      description?: string;
+      metadata?: Record<string, unknown>;
+      delivery?: 'steer' | 'queue';
+      resume?: boolean;
+    }): Promise<unknown>;
     /** v2 session.rename ({sessionID, title}). */
     rename?(input: Record<string, unknown>): Promise<unknown>;
     /** v2 session.switchAgent ({sessionID, agent}). */

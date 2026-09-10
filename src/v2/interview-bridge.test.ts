@@ -172,7 +172,9 @@ describe('v2 interview bridge', () => {
     await bridge.runtime.notify('ses_n', 'ready');
     expect(calls).toContainEqual({
       method: 'synthetic',
-      input: { sessionID: 'ses_n', text: 'ready' },
+      // resume:false = admit the interview URL without waking the session
+      // (v1's noReply prompt equivalent; no agent turn, no double-send).
+      input: { sessionID: 'ses_n', text: 'ready', resume: false },
     });
 
     await bridge.runtime.continue('ses_c', 'go on');

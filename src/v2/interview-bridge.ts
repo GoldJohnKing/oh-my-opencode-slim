@@ -7,6 +7,7 @@ import { createInterviewServer } from '../interview/server';
 import { createInterviewService } from '../interview/service';
 import type { InterviewMessage } from '../interview/types';
 import { log } from '../utils/logger';
+import { createSessionListShim } from './client-shim';
 import { createSessionSubmit, textFromContent } from './session-submit';
 import type {
   V2CommandDraft,
@@ -90,14 +91,15 @@ export function createV2InterviewBridge(
   const runtime: InterviewSessionRuntime = {
     messages: async (sessionID) => transcripts.get(sessionID) ?? [],
     notify: async (sessionID, text) => {
-      // synthetic only — no prompt fallback: synthetic avoids triggering an
-      // agent turn; a prompt fallback would double-send and wake the loop.
+      // synthetic only — no prompt fallback: `resume: false` admits the
+      // input WITHOUT waking the session, mirroring the v1 noReply prompt
+      // (a prompt fallback would double-send and wake the loop).
       if (typeof methods.synthetic !== 'function') {
         log('[v2][interview] synthetic unavailable for notify', { sessionID });
         return;
       }
       try {
-        await methods.synthetic({ sessionID, text });
+        await methods.synthetic({ sessionID, text, resume: false });
       } catch (err) {
         log('[v2][interview] synthetic notify failed', {
           sessionID,
@@ -147,8 +149,11 @@ export function createV2InterviewBridge(
         outputFolder,
         {
           runtime,
+          // v1-shaped list over v2 session.list (directory discovery for
+          // the dashboard's session scan); empty page when the host lacks
+          // the method.
           sessionClient: {
-            list: async () => ({ data: [] }),
+            list: createSessionListShim(methods),
           } as never,
           server: options.server,
         },

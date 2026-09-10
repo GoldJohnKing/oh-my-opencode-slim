@@ -29,5 +29,7 @@ export type {
   V2SessionContextEvent,
   V2ToolAfterEvent,
   V2ToolBeforeEvent,
+  V2ToolDefinition,
   V2ToolDraft,
+  V2ToolOptions,
 } from './types';

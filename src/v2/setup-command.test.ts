@@ -1,5 +1,11 @@
 import { describe, expect, mock, test } from 'bun:test';
 import * as fs from 'node:fs/promises';
+import { appendTaggedSyntheticPart } from '../hooks/cache-safe-injection';
+import { createJsonErrorRecoveryHook } from '../hooks/json-error-recovery/hook';
+import {
+  createPhaseReminderHook,
+  PHASE_REMINDER_METADATA_KEY,
+} from '../hooks/phase-reminder';
 import {
   createToolLoopGuardHook,
   LOOP_GUARD_WARNING,
@@ -10,6 +16,7 @@ import {
   applyCommandMarkerToContext,
   createCommandRegistration,
   createSessionContextHandler,
+  createSessionPromptBridge,
   createToolExecuteBridges,
   parseCommandMarker,
   registerSynthCommands,
@@ -21,6 +28,7 @@ import type {
   V2CommandDefinition,
   V2CommandDraft,
   V2SessionContextEvent,
+  V2SessionPromptEvent,
 } from './types';
 
 function makeEvent(
@@ -538,6 +546,153 @@ describe('createSessionContextHandler (merged context hook seam)', () => {
   });
 });
 
+describe('context bridge: transcript user-message identity enrichment', () => {
+  // Live v2 hosts (verified beta-19365/beta-19378) carry only
+  // {id, time, text, type} on transcript user messages; the v1 injection
+  // gates (phase-reminder, board, nudge) key on info.sessionID/agent.
+  test('user messages gain sessionID/agent when absent; content bytes untouched', async () => {
+    const user = {
+      id: 'u1',
+      role: 'user',
+      time: 123,
+      content: [{ type: 'text', text: 'hello' }],
+    };
+    const contentBefore = structuredClone(user.content);
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async () => {},
+    });
+
+    await handler(makeEvent([user]));
+
+    expect(user.sessionID).toBe('ses_cmd');
+    expect(user.agent).toBe('orchestrator');
+    expect(user.content).toEqual(contentBefore);
+
+    // Idempotent + never overwrites: a later context event for a
+    // different session/agent must not restamp the enriched message.
+    await handler(
+      makeEvent([user], { sessionID: 'ses_other', agent: 'fixer' }),
+    );
+    expect(user.sessionID).toBe('ses_cmd');
+    expect(user.agent).toBe('orchestrator');
+  });
+
+  test('host-provided sessionID/agent values are preserved', async () => {
+    const user = {
+      id: 'u1',
+      role: 'user',
+      sessionID: 'host-ses',
+      agent: 'planner',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async () => {},
+    });
+
+    await handler(makeEvent([user]));
+
+    expect(user.sessionID).toBe('host-ses');
+    expect(user.agent).toBe('planner');
+  });
+
+  test('assistant messages are left untouched', async () => {
+    const assistant = {
+      id: 'a1',
+      role: 'assistant',
+      time: 456,
+      content: [{ type: 'text', text: 'response' }],
+    };
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async () => {},
+    });
+
+    await handler(makeEvent([assistant]));
+
+    expect(assistant.sessionID).toBeUndefined();
+    expect(assistant.agent).toBeUndefined();
+  });
+
+  test('agent falls back to the prompt-bridge learned state when the event carries none', async () => {
+    const user = {
+      id: 'u1',
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async () => {},
+      knownAgentForSession: (sessionID) =>
+        sessionID === 'ses_cmd' ? 'oracle' : undefined,
+    });
+
+    await handler(makeEvent([user], { agent: '' }));
+
+    expect(user.sessionID).toBe('ses_cmd');
+    expect(user.agent).toBe('oracle');
+  });
+
+  test('no enrichment without a messagesTransform dep (mutation stays scoped)', async () => {
+    const user = {
+      id: 'u1',
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+    });
+
+    await handler(makeEvent([user]));
+
+    expect(user.sessionID).toBeUndefined();
+    expect(user.agent).toBeUndefined();
+  });
+
+  test('end-to-end: a recognized agent now performs the phase-reminder injection it previously skipped', async () => {
+    const phaseReminder = createPhaseReminderHook({
+      shouldInject: () => true,
+    });
+
+    // The pre-fix behavior: the raw v2 transcript message (no
+    // sessionID/agent) fails the gate inside the real v1 hook.
+    const unenriched = {
+      info: { role: 'user' },
+      parts: [{ type: 'text', text: 'do the work' }],
+    };
+    await phaseReminder['experimental.chat.messages.transform'](
+      {},
+      { messages: [unenriched] },
+    );
+    expect(unenriched.parts).toHaveLength(1);
+
+    // Through the v2 context bridge: identity enrichment makes the same
+    // gate pass and the reminder lands as a tagged synthetic part.
+    const message = {
+      id: 'u1',
+      role: 'user',
+      time: 123,
+      content: [{ type: 'text', text: 'do the work' }],
+    };
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: phaseReminder['experimental.chat.messages.transform'],
+    });
+
+    await handler(makeEvent([message]));
+
+    expect(message.content).toHaveLength(2);
+    const injected = message.content[1] as Record<string, unknown>;
+    expect(injected.synthetic).toBe(true);
+    expect(
+      (injected.metadata as Record<string, unknown>)[
+        PHASE_REMINDER_METADATA_KEY
+      ],
+    ).toBe(true);
+  });
+});
+
 describe('tool execute bridge normalization', () => {
   test('before bridge maps subagent call into v1 task shape and writes back', async () => {
     const seen: Array<{ tool: string; args: unknown }> = [];
@@ -833,5 +988,445 @@ describe('tool execute bridge normalization', () => {
       'task_id: ses_child\nstate: running',
     );
     expect(nextTurn).not.toContain(LOOP_GUARD_WARNING);
+  });
+});
+
+describe('tool execute bridge status discrimination', () => {
+  test('error status synthesizes the v1 output from the error text', async () => {
+    const seen: Array<{ tool: string; output: unknown }> = [];
+    const after = async (_i: unknown, o: { output: unknown }) => {
+      seen.push({ tool: 'task', output: o.output });
+    };
+    const { afterBridge } = createToolExecuteBridges(undefined, after);
+    const event = {
+      tool: 'subagent',
+      sessionID: 's',
+      agent: 'a',
+      messageID: 'm',
+      id: 'c',
+      input: {},
+      status: 'error' as const,
+      error: 'invalid JSON in tool arguments',
+      // Stale result content that must NOT be presented as success.
+      result: { content: 'previous successful output' },
+    };
+    await afterBridge(event);
+    expect(seen[0]?.output).toBe('invalid JSON in tool arguments');
+    // Hook saw the error text; the stale content was never surfaced.
+  });
+
+  test('error status with an Error-like payload uses message', async () => {
+    const seen: unknown[] = [];
+    const { afterBridge } = createToolExecuteBridges(
+      undefined,
+      async (_i, o: { output: unknown }) => {
+        seen.push(o.output);
+      },
+    );
+    await afterBridge({
+      tool: 'read',
+      sessionID: 's',
+      agent: 'a',
+      messageID: 'm',
+      id: 'c',
+      input: {},
+      status: 'error',
+      error: { message: 'file not found' },
+      result: undefined,
+    });
+    expect(seen).toEqual(['file not found']);
+  });
+
+  test('errored output still feeds json-error-recovery (reminder appended)', async () => {
+    const recovery = createJsonErrorRecoveryHook({} as never);
+    const event = {
+      tool: 'task',
+      sessionID: 's',
+      agent: 'a',
+      messageID: 'm',
+      id: 'c',
+      input: {},
+      status: 'error' as const,
+      error: 'SyntaxError: Unexpected token in JSON',
+      result: {},
+    };
+    const { afterBridge } = createToolExecuteBridges(
+      undefined,
+      recovery['tool.execute.after'],
+    );
+    await afterBridge(event);
+    // The reminder the recovery hook appended to output.output must land
+    // in the model-visible content field of the errored result.
+    expect(event.result.content).toContain('invalid JSON arguments');
+    expect(event.result.content).toContain('SyntaxError');
+  });
+
+  test('error status with no error field never presents result content as success', async () => {
+    const seen: unknown[] = [];
+    const { afterBridge } = createToolExecuteBridges(
+      undefined,
+      async (_i, o: { output: unknown }) => {
+        seen.push(o.output);
+      },
+    );
+    const event = {
+      tool: 'bash',
+      sessionID: 's',
+      agent: 'a',
+      messageID: 'm',
+      id: 'c',
+      input: {},
+      status: 'error' as const,
+      result: { content: [], output: { stale: true } },
+    };
+    await afterBridge(event);
+    // Neither the empty content nor the structured stale output is
+    // rendered as a successful output.
+    expect(seen).toEqual(['']);
+  });
+
+  test('absent status (older hosts) keeps the completed path', async () => {
+    const seen: unknown[] = [];
+    const event = {
+      tool: 'subagent',
+      sessionID: 's',
+      agent: 'a',
+      messageID: 'm',
+      id: 'c',
+      input: {},
+      result: { content: 'plain output' },
+    } as Record<string, unknown> & { result?: unknown };
+    const { afterBridge } = createToolExecuteBridges(
+      undefined,
+      async (_i, o: { output: unknown }) => {
+        seen.push(o.output);
+      },
+    );
+    await afterBridge(event);
+    expect(seen).toEqual(['plain output']);
+  });
+});
+
+describe('createSessionPromptBridge (native session.prompt hook)', () => {
+  function makePromptEvent(
+    overrides: Partial<V2SessionPromptEvent> = {},
+  ): V2SessionPromptEvent {
+    return {
+      sessionID: 'ses_p',
+      messageID: 'msg_1',
+      prompt: { text: 'do the thing' },
+      delivery: 'steer',
+      ...overrides,
+    };
+  }
+
+  test('handlePrompt delivers chat.message once per admission with parts', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.handlePrompt(makePromptEvent());
+    expect(calls).toEqual([
+      {
+        sessionID: 'ses_p',
+        messageID: 'msg_1',
+        parts: [{ type: 'text', text: 'do the thing' }],
+      },
+    ]);
+
+    // Re-fired admission with the same messageID: still once.
+    await bridge.handlePrompt(makePromptEvent());
+    expect(calls).toHaveLength(1);
+
+    // A new admission: fires again.
+    await bridge.handlePrompt(makePromptEvent({ messageID: 'msg_2' }));
+    expect(calls).toHaveLength(2);
+  });
+
+  test('handlePrompt maps prompt files into v1 file parts', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.handlePrompt(
+      makePromptEvent({
+        prompt: {
+          text: '',
+          files: [{ uri: 'file:///a.txt', name: 'a.txt' }],
+        },
+      }),
+    );
+    // observeChatMessage (task-session-manager + wake scheduler) gates on
+    // a non-synthetic text/file part — the file part keeps that gate
+    // passable for attachment-only prompts.
+    expect(calls[0]?.parts).toEqual([
+      { type: 'file', uri: 'file:///a.txt', name: 'a.txt' },
+    ]);
+  });
+
+  test('observeContext forwards newly learned agent/model, then goes quiet', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    const contextEvent = makeEvent(
+      [
+        {
+          id: 'msg_1',
+          role: 'user',
+          content: [{ type: 'text', text: 'hi' }],
+        },
+      ],
+      {
+        sessionID: 'ses_p',
+        agent: 'orchestrator',
+        model: { id: 'claude-x', providerID: 'anthropic' },
+      },
+    );
+    await bridge.observeContext(contextEvent);
+    expect(calls).toEqual([
+      {
+        sessionID: 'ses_p',
+        agent: 'orchestrator',
+        model: { providerID: 'anthropic', modelID: 'claude-x' },
+        messageID: 'msg_1',
+      },
+    ]);
+
+    // Repeated context events with the same agent/model: no more calls
+    // (once-per-admission fidelity — message-scoped delivery belongs to
+    // the prompt hook).
+    await bridge.observeContext(contextEvent);
+    await bridge.observeContext(contextEvent);
+    expect(calls).toHaveLength(1);
+
+    // A model change is newly learned state → one forwarded call.
+    await bridge.observeContext(
+      makeEvent(
+        [{ id: 'msg_2', role: 'user', content: [{ type: 'text', text: 'x' }] }],
+        {
+          sessionID: 'ses_p',
+          agent: 'orchestrator',
+          model: { id: 'claude-fallback', providerID: 'anthropic' },
+        },
+      ),
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.model).toEqual({
+      providerID: 'anthropic',
+      modelID: 'claude-fallback',
+    });
+  });
+
+  test('agent learned from context is carried by the next admission', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.observeContext(
+      makeEvent(
+        [
+          {
+            id: 'msg_1',
+            role: 'user',
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        ],
+        { sessionID: 'ses_p', agent: 'orchestrator' },
+      ),
+    );
+    await bridge.handlePrompt(makePromptEvent({ messageID: 'msg_2' }));
+    expect(calls.at(-1)).toMatchObject({
+      sessionID: 'ses_p',
+      messageID: 'msg_2',
+      agent: 'orchestrator',
+    });
+  });
+
+  test('handlePrompt feeds the real observeChatMessage consumers', async () => {
+    // The v1 observeChatMessage gate that never passed via the context
+    // emulation (no parts) must pass via the prompt hook: a non-synthetic
+    // text part + messageID present.
+    const observed: Array<{ sessionID: string; messageID?: string }> = [];
+    const bridge = createSessionPromptBridge((input) => {
+      observed.push({
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+      });
+      return Promise.resolve();
+    });
+    await bridge.handlePrompt(makePromptEvent());
+    expect(observed).toEqual([{ sessionID: 'ses_p', messageID: 'msg_1' }]);
+  });
+
+  test('handlePrompt restores the internal-initiator marker from prompt metadata (wake admissions stay internal)', async () => {
+    // The v2 orchestrator-wake queue prompt arrives with the marker as
+    // prompt metadata (part metadata cannot survive the text-only v2
+    // translation). The rebuilt parts view must carry the v1 part marker
+    // so isInternalInitiatorPart consumers — orchestrator-wake's
+    // observeChatMessage in particular — treat the admission as internal
+    // (no no-progress rearm, no timer clear).
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    await bridge.handlePrompt(
+      makePromptEvent({
+        prompt: { text: '<system-reminder>wake</system-reminder>' },
+        metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+      }),
+    );
+    expect(calls[0]?.parts).toEqual([
+      {
+        type: 'text',
+        text: '<system-reminder>wake</system-reminder>',
+        synthetic: true,
+        metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+      },
+    ]);
+    // The restored marker must satisfy the real v1 gate.
+    const { isInternalInitiatorPart } = await import(
+      '../utils/internal-initiator'
+    );
+    const parts = calls[0]?.parts as unknown[];
+    expect(parts.some((part) => isInternalInitiatorPart(part))).toBe(true);
+
+    // Without the metadata flag the parts view stays plain (external).
+    const plainCalls: Array<Record<string, unknown>> = [];
+    const bridge2 = createSessionPromptBridge(async (input) => {
+      plainCalls.push(input as Record<string, unknown>);
+    });
+    await bridge2.handlePrompt(
+      makePromptEvent({ prompt: { text: 'user text' } }),
+    );
+    expect(plainCalls[0]?.parts).toEqual([{ type: 'text', text: 'user text' }]);
+  });
+
+  test('malformed prompt events are ignored without throwing', async () => {
+    const calls: unknown[] = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input);
+    });
+    await expect(
+      bridge.handlePrompt({
+        sessionID: '',
+        messageID: 'm',
+        prompt: { text: 't' },
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      bridge.handlePrompt({
+        sessionID: 's',
+        messageID: '',
+        prompt: { text: 't' },
+      }),
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('context handler: native prompt mode + CacheHint', () => {
+  test('observeContextAgent runs and the per-request emulation is skipped', async () => {
+    const observed: string[] = [];
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      // Native prompt-hook mode: no chatMessage emulation dep — agent
+      // tracking flows through observeContextAgent instead.
+      observeContextAgent: async (event) => {
+        observed.push(event.sessionID);
+      },
+    });
+    await handler(makeEvent([{ id: 'u', role: 'user', content: [] }]));
+    expect(observed).toEqual(['ses_cmd']);
+  });
+
+  test('v2-injected parts carry cache:{type:"ephemeral"} via the bridge', async () => {
+    const message = {
+      id: 'u',
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const event = makeEvent([message]);
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async (_input, output) => {
+        const target = output.messages.at(-1);
+        if (!target) throw new Error('no message');
+        appendTaggedSyntheticPart(target, {
+          text: 'INJECTED REMINDER',
+          metadataKey: 'omos_test_tag',
+        });
+      },
+      syntheticPartCacheHint: { type: 'ephemeral' },
+    });
+
+    await handler(event);
+
+    const injected = message.content.at(-1) as Record<string, unknown>;
+    expect(injected.cache).toEqual({ type: 'ephemeral' });
+  });
+
+  test('without the hint dep injected parts stay byte-identical to v1', async () => {
+    const message = {
+      id: 'u',
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const event = makeEvent([message]);
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async (_input, output) => {
+        const target = output.messages.at(-1);
+        if (!target) throw new Error('no message');
+        appendTaggedSyntheticPart(target, {
+          text: 'INJECTED REMINDER',
+          metadataKey: 'omos_test_tag',
+        });
+      },
+    });
+
+    await handler(event);
+
+    const injected = message.content.at(-1) as Record<string, unknown>;
+    expect(injected.cache).toBeUndefined();
+    expect(injected).toEqual({
+      type: 'text',
+      synthetic: true,
+      text: 'INJECTED REMINDER',
+      metadata: { omos_test_tag: true },
+    });
+  });
+
+  test('hint scoping restores the default after the transform', async () => {
+    // Outside the bridged transform, injection must not carry the hint —
+    // proves the set/restore wrapper cannot leak into v1-path calls.
+    const probe: Array<Record<string, unknown>> = [];
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async (_input, output) => {
+        const target = output.messages.at(-1);
+        if (!target) throw new Error('no message');
+        appendTaggedSyntheticPart(target, {
+          text: 'inside',
+          metadataKey: 'omos_test_tag',
+        });
+      },
+      syntheticPartCacheHint: { type: 'ephemeral' },
+    });
+    await handler(makeEvent([{ id: 'u', role: 'user', content: [] }]));
+    appendTaggedSyntheticPart(
+      {
+        info: { role: 'user' },
+        get parts() {
+          return probe;
+        },
+        set parts(value) {
+          probe.push(...(value as Array<Record<string, unknown>>));
+        },
+      } as never,
+      { text: 'outside', metadataKey: 'omos_test_tag' },
+    );
+    const outside = { ...probe.at(-1) } as Record<string, unknown>;
+    expect(outside.cache).toBeUndefined();
   });
 });

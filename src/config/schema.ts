@@ -244,10 +244,16 @@ export const BackgroundJobsConfigSchema = z.object({
         .describe(
           'Continuous parent-idle interval between orchestrator wake evaluations (60,000–2,147,483,647ms). Default 300,000 (5 minutes). 0 is invalid.',
         ),
+      mode: z
+        .enum(['auto', 'todo', 'children'])
+        .default('auto')
+        .describe(
+          'Wake-condition source. "auto" uses todo-gating on v1 hosts and children-driven degraded mode on v2 hosts (no todo surface there); "todo" or "children" pin one mode, degrading to children when the host lacks the todo API. Default "auto".',
+        ),
     })
-    .default({ enabled: true, intervalMs: 300_000 })
+    .default({ enabled: true, intervalMs: 300_000, mode: 'auto' })
     .describe(
-      'Periodic orchestrator wake scheduler for idle sessions with incomplete todos. Default enabled at a 5-minute interval. Requires host session APIs (session.get, todo, children, status, promptAsync); inactive on the v2 shim.',
+      'Periodic orchestrator wake scheduler for idle sessions. v1: requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. v2: runs in children-driven degraded mode (requires session.list + promptAsync) and wakes while un-finished child sessions remain. Default enabled at a 5-minute interval.',
     ),
   wallClockTimeoutMs: z
     .union([z.literal(0), z.number().int().min(60_000).max(2_147_483_647)])
