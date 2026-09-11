@@ -66,6 +66,46 @@ describe('task_cancel tool', () => {
     });
   });
 
+  test('verifies quiescence via host session info when the status map is unavailable (v2)', async () => {
+    // v2 hosts expose no session.status map; the old verify loop polled a
+    // source that can never answer 'idle' and always threw "did not stay
+    // stopped" — even after a confirmed abort. Verification must fall back
+    // to the host session info (terminal outcome / fresh idle timestamp).
+    const board = new BackgroundJobBoard();
+    const abort = mock(async () => ({}));
+    const getSession = mock(async () => ({
+      data: { outcome: 'interrupted', time: { idle: Date.now() } },
+    }));
+    mockClient = {
+      session: { abort, get: getSession, delete: mock(async () => ({})) },
+    };
+    const tools = createCancelTaskTool({
+      input: { directory: '/test/project' } as any,
+      backgroundJobBoard: board,
+      shouldManageSession: () => true,
+      verifyAbortMs: 10,
+      abortRetryIntervalMs: 0,
+      stableStoppedMs: 0,
+    });
+    board.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+
+    const output = await tools.task_cancel.execute(
+      { task_id: 'ses_1', reason: 'obsolete' },
+      context,
+    );
+
+    expect(abort).toHaveBeenCalledWith({ path: { id: 'ses_1' } });
+    expect(getSession).toHaveBeenCalled();
+    expect(parseTaskStatusOutput(String(output))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'cancelled',
+    });
+  });
+
   test('retains the session and leaves it resumable after acknowledgement', async () => {
     const { board, deleteSession, taskCancel } = createTool();
     board.registerLaunch({

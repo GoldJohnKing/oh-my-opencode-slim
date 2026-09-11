@@ -6,6 +6,15 @@ import {
   STOP_CONFIRMATION_GRACE_MS,
 } from './stop-confirmation';
 
+/** Wall-clock slack before the post-grace self-observation fires. */
+const QUIESCENT_CONFIRM_SLACK_MS = 25;
+
+const HOST_TERMINAL_OUTCOMES = new Set(['succeeded', 'failed', 'interrupted']);
+
+function isHostTerminalOutcome(outcome: string | undefined): boolean {
+  return outcome !== undefined && HOST_TERMINAL_OUTCOMES.has(outcome);
+}
+
 export function createIdleReconciler(options: {
   backgroundJobBoard: BackgroundJobStore;
   reconcileInjectedTerminalJobs: (parentSessionID: string) => void;
@@ -26,6 +35,11 @@ export function createIdleReconciler(options: {
     prune(board: { taskIDs(): Set<string> }): void;
   };
   revivedRunTracker?: RevivedRunTracker;
+  /** Host-native terminal outcome probe (v2 Session.Info.outcome via
+   * session.get). Quiescent jobs settle to the accurate terminal state
+   * instead of lingering 'running + statusUncertain' on hosts without a
+   * live session-status map. Return undefined when unavailable. */
+  readSessionOutcome?: (sessionID: string) => Promise<string | undefined>;
 }) {
   const idleReconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const childIdleReconcileTimers = new Map<
@@ -33,6 +47,10 @@ export function createIdleReconciler(options: {
     ReturnType<typeof setTimeout>
   >();
   const errorTerminalizeTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  const quiescentConfirmTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
   >();
@@ -107,6 +125,68 @@ export function createIdleReconciler(options: {
         });
         return;
       }
+
+      // Host-native outcome confirmation (v2: no session.status map, but
+      // Session.Info.outcome publishes the terminal transition). Settles
+      // the quiescent job to its accurate terminal state instead of the
+      // cancellation-flavored 'stopped' below.
+      if (options.readSessionOutcome) {
+        let outcome: string | undefined;
+        try {
+          outcome = await options.readSessionOutcome(sessionID);
+        } catch (error) {
+          log('[task-session-manager] host outcome probe failed', {
+            sessionID,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        const latest = options.backgroundJobBoard.get(sessionID);
+        const guardsIntact =
+          latest !== undefined &&
+          latest.state === 'running' &&
+          latest.generation === observedGeneration &&
+          !(
+            latest.lastLiveBusyAt !== undefined &&
+            latest.lastLiveBusyAt > idleObservedAt
+          );
+        if (guardsIntact && isHostTerminalOutcome(outcome)) {
+          const settled = options.backgroundJobBoard.updateStatus({
+            taskID: sessionID,
+            expectedGeneration: observedGeneration,
+            state: outcome === 'succeeded' ? 'completed' : 'error',
+            resultSummary: `Host reported outcome: ${outcome}.`,
+          });
+          if (
+            settled !== undefined &&
+            settled.generation === observedGeneration &&
+            settled.state !== 'running'
+          ) {
+            options.backgroundJobBoard.markReconciled(sessionID);
+            log(
+              '[task-session-manager] confirmed terminal outcome from host session info',
+              {
+                sessionID,
+                alias: latest.alias,
+                parentSessionID: latest.parentSessionID,
+                outcome,
+              },
+            );
+            return;
+          }
+        }
+      }
+
+      // No host outcome (or probe unavailable): schedule the post-grace
+      // stop-confirmation re-observation ourselves. The v1 design relied on
+      // the periodic runtime-status reconciler to make the second
+      // observation; that reconciler is disabled on hosts without
+      // session.status (v2), which left quiescent jobs 'running' with an
+      // unconfirmed status forever (#1157 follow-up).
+      scheduleQuiescentStopConfirmation(
+        sessionID,
+        observedGeneration,
+        idleObservedAt,
+      );
       log('[task-session-manager] observed quiescent job from idle', {
         sessionID,
         alias: job.alias,
@@ -114,6 +194,57 @@ export function createIdleReconciler(options: {
       });
     }, options.idleReconcileDelayMs).unref?.();
     childIdleReconcileTimers.set(sessionID, timer);
+  }
+
+  /**
+   * One-shot post-grace stop confirmation for quiescent jobs. Uses a
+   * synthetic re-observation timestamp (idle + grace + 1) so the existing
+   * observeNonBusyRuntime grace logic confirms the stop; the busy guard
+   * still protects against a session that recovered in the meantime.
+   */
+  function scheduleQuiescentStopConfirmation(
+    sessionID: string,
+    observedGeneration: number,
+    idleObservedAt: number,
+  ): void {
+    if (quiescentConfirmTimers.has(sessionID)) return;
+    const graceMs =
+      options.stopConfirmationGraceMs ?? STOP_CONFIRMATION_GRACE_MS;
+    const timer = setTimeout(() => {
+      quiescentConfirmTimers.delete(sessionID);
+      if (options.isFallbackInProgress?.(sessionID)) return;
+      const job = options.backgroundJobBoard.get(sessionID);
+      if (job?.state !== 'running' || job.generation !== observedGeneration) {
+        return;
+      }
+      if (
+        job.lastLiveBusyAt !== undefined &&
+        job.lastLiveBusyAt > idleObservedAt
+      ) {
+        return;
+      }
+      const updated = observeNonBusyRuntime({
+        backgroundJobBoard: options.backgroundJobBoard,
+        taskID: sessionID,
+        observedAt: idleObservedAt + graceMs + 1,
+        generation: observedGeneration,
+        graceMs,
+        lastStatusError:
+          'Runtime session is idle; task termination is unconfirmed.',
+        taskContextTracker: options.taskContextTracker,
+      });
+      if (updated?.state === 'stopped') {
+        log(
+          '[task-session-manager] confirmed runtime-stopped job after self-observed grace',
+          {
+            sessionID,
+            alias: updated.alias,
+            parentSessionID: updated.parentSessionID,
+          },
+        );
+      }
+    }, graceMs + QUIESCENT_CONFIRM_SLACK_MS).unref?.();
+    quiescentConfirmTimers.set(sessionID, timer);
   }
 
   /**
@@ -190,6 +321,11 @@ export function createIdleReconciler(options: {
       clearTimeout(pendingChildIdle);
       childIdleReconcileTimers.delete(sessionID);
     }
+    const pendingQuiescentConfirm = quiescentConfirmTimers.get(sessionID);
+    if (pendingQuiescentConfirm) {
+      clearTimeout(pendingQuiescentConfirm);
+      quiescentConfirmTimers.delete(sessionID);
+    }
     const pendingIdle = idleReconcileTimers.get(sessionID);
     if (pendingIdle) {
       clearTimeout(pendingIdle);
@@ -211,6 +347,11 @@ export function createIdleReconciler(options: {
       clearTimeout(timer);
     }
     childIdleReconcileTimers.clear();
+
+    for (const timer of quiescentConfirmTimers.values()) {
+      clearTimeout(timer);
+    }
+    quiescentConfirmTimers.clear();
 
     for (const timer of errorTerminalizeTimers.values()) {
       clearTimeout(timer);

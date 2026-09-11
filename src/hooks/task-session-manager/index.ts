@@ -15,6 +15,7 @@ import {
   recordBackgroundJobSuppression,
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
+import { getClient } from '../../utils/opencode-client';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -271,6 +272,28 @@ export function createTaskSessionManagerHook(
     isCurrentIdleSessionToken: (s, t) => isCurrentIdleSessionToken(s, t),
     taskContextTracker,
     revivedRunTracker: options.revivedRunTracker,
+    // v2: no live session-status map exists, but Session.Info.outcome
+    // publishes the terminal transition — use it to settle quiescent jobs
+    // to their accurate terminal state (v1 hosts keep the status-map
+    // confirmation and simply never hit this probe).
+    readSessionOutcome: async (sessionID) => {
+      try {
+        const client = getClient(_ctx);
+        if (typeof client.session?.get !== 'function') return undefined;
+        const response = (await client.session.get({
+          path: { id: sessionID },
+          query: { directory: _ctx.directory },
+        })) as {
+          data?: { outcome?: unknown };
+          outcome?: unknown;
+        };
+        const info = response?.data ?? response;
+        const outcome = info?.outcome;
+        return typeof outcome === 'string' ? outcome : undefined;
+      } catch {
+        return undefined;
+      }
+    },
   });
   const runtimeStatusReconciler = createRuntimeStatusReconciler({
     input: _ctx,

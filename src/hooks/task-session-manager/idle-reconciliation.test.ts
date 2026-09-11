@@ -6,7 +6,10 @@ async function flushChildIdleReconcile(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
-function createHarness(options?: { stopConfirmationGraceMs?: number }) {
+function createHarness(options?: {
+  stopConfirmationGraceMs?: number;
+  readSessionOutcome?: (sessionID: string) => Promise<string | undefined>;
+}) {
   const board = new BackgroundJobBoard();
   const terminalListener = mock(() => {});
   board.addTerminalStateListener(terminalListener);
@@ -25,6 +28,7 @@ function createHarness(options?: { stopConfirmationGraceMs?: number }) {
       contextFilesForPrompt,
       prune,
     },
+    readSessionOutcome: options?.readSessionOutcome,
   });
   board.registerLaunch({
     taskID: 'child-1',
@@ -115,5 +119,79 @@ describe('idle reconciliation stop confirmation', () => {
     expect(board.get('child-1')).toMatchObject({ state: 'running' });
     expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(21);
     expect(terminalListener).not.toHaveBeenCalled();
+  });
+});
+
+describe('host outcome confirmation (v2: no session.status map)', () => {
+  test('quiescent job with host outcome succeeded settles completed and reconciled', async () => {
+    const readSessionOutcome = mock(async () => 'succeeded' as const);
+    const { board, reconciler, terminalListener } = createHarness({
+      stopConfirmationGraceMs: 60_000,
+      readSessionOutcome,
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    await observeIdle(reconciler, 10, generation);
+
+    expect(readSessionOutcome).toHaveBeenCalledWith('child-1');
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalState: 'completed',
+      terminalUnreconciled: false,
+      statusUncertain: false,
+    });
+    expect(terminalListener).toHaveBeenCalledTimes(1);
+  });
+
+  test('quiescent job with host outcome failed settles error', async () => {
+    const { board, reconciler } = createHarness({
+      stopConfirmationGraceMs: 60_000,
+      readSessionOutcome: async () => 'failed',
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    await observeIdle(reconciler, 10, generation);
+
+    const record = board.get('child-1');
+    expect(record).toMatchObject({
+      state: 'reconciled',
+      terminalState: 'error',
+      terminalUnreconciled: false,
+    });
+    expect((record?.resultSummary ?? '').toLowerCase()).not.toContain(
+      'undefined',
+    );
+    expect(record?.resultSummary).toBe('Host reported outcome: failed.');
+  });
+
+  test('late busy after idle wins over a stale host outcome probe', async () => {
+    const { board, reconciler } = createHarness({
+      stopConfirmationGraceMs: 60_000,
+      readSessionOutcome: async () => 'succeeded',
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    board.markRunningFromLiveSession('child-1', 20); // busy AFTER idleObservedAt 10
+    await observeIdle(reconciler, 10, generation);
+
+    expect(board.get('child-1')).toMatchObject({ state: 'running' });
+  });
+
+  test('quiescent job without a host outcome self-confirms stopped after grace', async () => {
+    const { board, reconciler, terminalListener } = createHarness({
+      stopConfirmationGraceMs: 5,
+      readSessionOutcome: async () => undefined,
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    await observeIdle(reconciler, 10, generation);
+    expect(board.get('child-1')).toMatchObject({ state: 'running' });
+
+    // No external re-observation: the reconciler must complete the stop
+    // confirmation itself after the grace elapses (the v1 design relied on
+    // the periodic runtime-status reconciler, which is unavailable on v2).
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(board.get('child-1')).toMatchObject({ state: 'stopped' });
+    expect(terminalListener).toHaveBeenCalledTimes(1);
   });
 });
