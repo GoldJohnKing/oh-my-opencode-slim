@@ -377,6 +377,70 @@ describe('v2 client shim delegation', () => {
     });
   });
 
+  test('mixed fallback replays (user parts + internal reminder) stay on session.prompt with files', async () => {
+    // Regression for the greptile P1 on #1158: foreground-fallback appends
+    // an internal-initiator reminder part to the user's real replay parts.
+    // An ANY-part gate routed the whole mixed body through
+    // session.synthetic — dropping the file attachments (the synthetic
+    // branch forwards text only) and skipping user-input persistence.
+    // Only PURELY internal bodies may take the synthetic route.
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const input = buildPluginInput(
+      makeCtx({
+        switchModel: async () => {},
+        prompt: async (i: unknown) => {
+          seq.push({ m: 'prompt', i });
+          return {};
+        },
+        synthetic: async (i: unknown) => {
+          seq.push({ m: 'synthetic', i });
+          return {};
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: {
+          promptAsync: (
+            a: Record<string, unknown> & {
+              delivery?: 'steer' | 'queue';
+              modelSwitch?: 'required';
+            },
+          ) => Promise<unknown>;
+        };
+      }
+    ).session.promptAsync({
+      path: { id: 'ses_1' },
+      body: {
+        agent: 'orchestrator',
+        model: { providerID: 'anthropic', modelID: 'claude-fallback' },
+        parts: [
+          { type: 'text', text: 'analyze this screenshot' },
+          {
+            type: 'file',
+            url: 'file:///tmp/shot.png',
+            mime: 'image/png',
+          },
+          createInternalAgentTextPart(
+            "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>",
+          ),
+        ],
+      },
+      modelSwitch: 'required',
+    });
+    expect(seq).toHaveLength(1);
+    expect(seq[0].m).toBe('prompt');
+    expect(seq[0].i).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'steer',
+      metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+    });
+    expect((seq[0].i as { text: string }).text).toContain(
+      'analyze this screenshot',
+    );
+    expect((seq[0].i as { files: unknown[] }).files).toHaveLength(1);
+  });
+
   test('abort delegates to interrupt', async () => {
     const calls: unknown[] = [];
     const input = buildPluginInput(
