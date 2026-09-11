@@ -198,12 +198,15 @@ describe('v2 client shim delegation', () => {
     });
   });
 
-  test('promptAsync carries the internal-initiator marker as prompt metadata (wake cap survival)', async () => {
-    // The v1 wake prompt's part metadata cannot survive the text-only v2
-    // translation; the marker must travel as prompt `metadata` (accepted
-    // and propagated by the v2 session.prompt endpoint + hook) so the
-    // session-prompt bridge can restore it and observeChatMessage does
-    // NOT classify the wake admission as external user activity.
+  test('promptAsync keeps prompting as the degraded path when the host lacks session.synthetic', async () => {
+    // Degraded host (no session.synthetic): the v1 wake prompt's part
+    // metadata cannot survive the text-only v2 translation, so the marker
+    // travels as prompt `metadata` (accepted and propagated by the v2
+    // session.prompt endpoint + hook) — the session-prompt bridge can
+    // still restore it so observeChatMessage does NOT classify the wake
+    // admission as external user activity. On such hosts the wake stays a
+    // visible user message (pre-fix behavior); hosts with session.synthetic
+    // route through it instead (see the tests below).
     const seq: Array<{ m: string; i: unknown }> = [];
     const input = buildPluginInput(
       makeCtx({
@@ -249,6 +252,129 @@ describe('v2 client shim delegation', () => {
       body: { parts: [{ type: 'text', text: 'user says hi' }] },
     });
     expect(seq[1].i).not.toHaveProperty('metadata');
+  });
+
+  test('promptAsync routes internal-initiator bodies through session.synthetic', async () => {
+    // v2 session.synthetic admits the wake text WITHOUT persisting it as
+    // user input: no visible user bubble in the TUI, model still sees it,
+    // and `resume: true` (default wake) keeps the wake semantics.
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const input = buildPluginInput(
+      makeCtx({
+        prompt: async (i: unknown) => {
+          seq.push({ m: 'prompt', i });
+          return {};
+        },
+        synthetic: async (i: unknown) => {
+          seq.push({ m: 'synthetic', i });
+          return { admitted: true };
+        },
+      } as never),
+    );
+    const result = await (
+      input.client as {
+        session: {
+          promptAsync: (
+            a: Record<string, unknown> & { delivery?: 'steer' | 'queue' },
+          ) => Promise<unknown>;
+        };
+      }
+    ).session.promptAsync({
+      path: { id: 'ses_1' },
+      body: {
+        agent: 'orchestrator',
+        parts: [createInternalAgentTextPart('wake reminder')],
+      },
+      delivery: 'queue',
+      throwOnError: true,
+    });
+    expect(seq).toHaveLength(1);
+    expect(seq[0].m).toBe('synthetic');
+    expect(seq[0].i).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'queue',
+      resume: true,
+      metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+    });
+    expect(typeof (seq[0].i as { description?: unknown }).description).toBe(
+      'string',
+    );
+    expect((seq[0].i as { text: string }).text).toContain(
+      'SLIM_INTERNAL_INITIATOR',
+    );
+    expect(result).toMatchObject({ admitted: true });
+  });
+
+  test('internal-initiator synthetic routing keeps switchModel ordering', async () => {
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const input = buildPluginInput(
+      makeCtx({
+        switchModel: async (i: unknown) => {
+          seq.push({ m: 'switchModel', i });
+        },
+        prompt: async (i: unknown) => {
+          seq.push({ m: 'prompt', i });
+          return {};
+        },
+        synthetic: async (i: unknown) => {
+          seq.push({ m: 'synthetic', i });
+          return {};
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: { promptAsync: (a: unknown) => Promise<unknown> };
+      }
+    ).session.promptAsync({
+      path: { id: 'ses_1' },
+      body: {
+        agent: 'orchestrator',
+        model: { providerID: 'anthropic', modelID: 'claude-x' },
+        parts: [createInternalAgentTextPart('wake with model pin')],
+      },
+    });
+    expect(seq.map((c) => c.m)).toEqual(['switchModel', 'synthetic']);
+    expect(seq[1].i).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'steer',
+    });
+  });
+
+  test('plain external prompts never route through session.synthetic', async () => {
+    // foreground-fallback replays real user parts through promptAsync —
+    // those must keep hitting session.prompt even on synthetic-capable
+    // hosts, or the fallback replay would stop being persisted as the
+    // session's user input.
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const input = buildPluginInput(
+      makeCtx({
+        prompt: async (i: unknown) => {
+          seq.push({ m: 'prompt', i });
+          return {};
+        },
+        synthetic: async (i: unknown) => {
+          seq.push({ m: 'synthetic', i });
+          return {};
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: { promptAsync: (a: unknown) => Promise<unknown> };
+      }
+    ).session.promptAsync({
+      path: { id: 'ses_1' },
+      body: { parts: [{ type: 'text', text: 'fallback replay' }] },
+      modelSwitch: 'required',
+    });
+    expect(seq).toHaveLength(1);
+    expect(seq[0].m).toBe('prompt');
+    expect(seq[0].i).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'steer',
+      text: 'fallback replay',
+    });
   });
 
   test('abort delegates to interrupt', async () => {
