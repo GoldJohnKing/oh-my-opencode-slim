@@ -152,6 +152,25 @@ function internalInitiatorMetadataFromBody(
 }
 
 /**
+ * Pure-internal routing gate: ONLY bodies whose every part is an internal
+ * initiator may take the session.synthetic admission. Mixed bodies —
+ * notably foreground-fallback's replay of the user's real parts with an
+ * appended internal reminder — must stay on session.prompt so they remain
+ * persisted user input and keep their file attachments (the synthetic
+ * branch forwards text only). See the mixed-replay regression test and
+ * the greptile P1 review on #1158.
+ */
+function isPureInternalInitiatorBody(args: Record<string, unknown>): boolean {
+  const body = (args?.body ?? {}) as {
+    parts?: Array<Record<string, unknown>>;
+  };
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  return (
+    parts.length > 0 && parts.every((part) => isInternalInitiatorPart(part))
+  );
+}
+
+/**
  * Map one v2 `Session.Info` to the v1 list shape the shim's consumers
  * read (interview dashboard directory discovery: `directory`,
  * `time.updated`; identity fields for any future consumer). Only fields
@@ -321,10 +340,15 @@ export function buildPluginInput(
         // flag, which regressed them into visible user bubbles. v2's
         // dedicated session.synthetic admission keeps the text model-visible
         // while skipping user-message persistence, and its default `resume`
-        // preserves the wake semantics. Hosts without session.synthetic
-        // keep the pre-fix prompt path (visible wake, metadata intact).
+        // preserves the wake semantics. ONLY purely-internal bodies take
+        // this route — mixed bodies (foreground-fallback's user-parts +
+        // internal reminder replay) must stay on session.prompt to preserve
+        // user-input persistence and file attachments. Hosts without
+        // session.synthetic keep the pre-fix prompt path (visible wake,
+        // metadata intact).
         const internalViaSynthetic =
-          metadata !== undefined && typeof s.synthetic === 'function';
+          isPureInternalInitiatorBody(args) &&
+          typeof s.synthetic === 'function';
         if (!s.prompt && !internalViaSynthetic) {
           throw new Error('[v2] session.prompt unavailable for promptAsync');
         }
