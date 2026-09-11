@@ -16,6 +16,49 @@ import {
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { getClient } from '../../utils/opencode-client';
+
+/** Extract the final assistant text from a child session transcript
+ * (v1-shaped {data:[{info,parts}]} via the client shim's messages). Used
+ * by the quiescent-outcome settle path so completed jobs reconcile with a
+ * usable result summary instead of a placeholder. */
+async function readFinalAssistantText(
+  client: ReturnType<typeof getClient>,
+  sessionID: string,
+  directory: string,
+): Promise<string | undefined> {
+  if (typeof client.session?.messages !== 'function') return undefined;
+  try {
+    const response = (await client.session.messages({
+      path: { id: sessionID },
+      query: { directory },
+    })) as { data?: unknown };
+    const list = Array.isArray(response?.data) ? response.data : [];
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const message = isObjectRecord(list[i]) ? list[i] : undefined;
+      const info = isObjectRecord(message?.info) ? message.info : undefined;
+      if (info?.role !== 'assistant') continue;
+      const parts = Array.isArray(message?.parts) ? message.parts : [];
+      const text = parts
+        .filter(
+          (part: unknown) =>
+            isObjectRecord(part) &&
+            part.type === 'text' &&
+            typeof part.text === 'string' &&
+            part.text.length > 0,
+        )
+        .map((part: unknown) => (part as { text: string }).text)
+        .join('\n\n')
+        .trim();
+      // The trailing assistant message decides: text → usable; textless
+      // (e.g. tool-call handoff tail) → let stabilization retry.
+      return text.length > 0 ? text : undefined;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -289,7 +332,18 @@ export function createTaskSessionManagerHook(
         };
         const info = response?.data ?? response;
         const outcome = info?.outcome;
-        return typeof outcome === 'string' ? outcome : undefined;
+        if (typeof outcome !== 'string') return undefined;
+        if (outcome !== 'succeeded') return { outcome };
+        // Usable-result requirement (#1115 precedent): a completed job is
+        // only reconciled with its final assistant text. Extract it from
+        // the transcript; absent text falls back to the reconciler's
+        // stabilization probes.
+        const resultText = await readFinalAssistantText(
+          client,
+          sessionID,
+          _ctx.directory,
+        );
+        return { outcome, resultText };
       } catch {
         return undefined;
       }

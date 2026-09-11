@@ -1,5 +1,9 @@
 import type { BackgroundJobStore, ContextFile } from '../../utils';
 import { log } from '../../utils/logger';
+import {
+  COMPLETED_WITHOUT_TEXT_DIAGNOSTIC,
+  isHostTerminalOutcome,
+} from '../../utils/task';
 import type { RevivedRunTracker } from './revived-run-tracker';
 import {
   observeNonBusyRuntime,
@@ -9,10 +13,14 @@ import {
 /** Wall-clock slack before the post-grace self-observation fires. */
 const QUIESCENT_CONFIRM_SLACK_MS = 25;
 
-const HOST_TERMINAL_OUTCOMES = new Set(['succeeded', 'failed', 'interrupted']);
+/** Default stabilization probes for a succeeded-but-textless outcome
+ * (incident #1115 precedent: never reconcile a completed job without
+ * usable result text). */
+const DEFAULT_OUTCOME_STABILIZATION_PROBES = 3;
+const DEFAULT_OUTCOME_STABILIZATION_INTERVAL_MS = 300;
 
-function isHostTerminalOutcome(outcome: string | undefined): boolean {
-  return outcome !== undefined && HOST_TERMINAL_OUTCOMES.has(outcome);
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function createIdleReconciler(options: {
@@ -39,7 +47,11 @@ export function createIdleReconciler(options: {
    * session.get). Quiescent jobs settle to the accurate terminal state
    * instead of lingering 'running + statusUncertain' on hosts without a
    * live session-status map. Return undefined when unavailable. */
-  readSessionOutcome?: (sessionID: string) => Promise<string | undefined>;
+  readSessionOutcome?: (
+    sessionID: string,
+  ) => Promise<{ outcome?: string; resultText?: string } | undefined>;
+  /** Stabilization retries for a succeeded-but-textless outcome. */
+  outcomeStabilization?: { probes: number; intervalMs: number };
 }) {
   const idleReconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const childIdleReconcileTimers = new Map<
@@ -129,32 +141,60 @@ export function createIdleReconciler(options: {
       // Host-native outcome confirmation (v2: no session.status map, but
       // Session.Info.outcome publishes the terminal transition). Settles
       // the quiescent job to its accurate terminal state instead of the
-      // cancellation-flavored 'stopped' below.
+      // cancellation-flavored 'stopped' below. A succeeded outcome is only
+      // reconciled once usable result text exists — stabilization probes
+      // cover the outcome-before-text race, and textless completions are
+      // rejected per the incident #1115 precedent (never reconcile a
+      // completed job without a usable answer).
       if (options.readSessionOutcome) {
-        let outcome: string | undefined;
-        try {
-          outcome = await options.readSessionOutcome(sessionID);
-        } catch (error) {
-          log('[task-session-manager] host outcome probe failed', {
-            sessionID,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        const latest = options.backgroundJobBoard.get(sessionID);
-        const guardsIntact =
-          latest !== undefined &&
-          latest.state === 'running' &&
-          latest.generation === observedGeneration &&
-          !(
-            latest.lastLiveBusyAt !== undefined &&
-            latest.lastLiveBusyAt > idleObservedAt
+        const guardsIntact = (): boolean => {
+          const latest = options.backgroundJobBoard.get(sessionID);
+          return (
+            latest !== undefined &&
+            latest.state === 'running' &&
+            latest.generation === observedGeneration &&
+            !(
+              latest.lastLiveBusyAt !== undefined &&
+              latest.lastLiveBusyAt > idleObservedAt
+            )
           );
-        if (guardsIntact && isHostTerminalOutcome(outcome)) {
+        };
+        const stabilization = options.outcomeStabilization ?? {
+          probes: DEFAULT_OUTCOME_STABILIZATION_PROBES,
+          intervalMs: DEFAULT_OUTCOME_STABILIZATION_INTERVAL_MS,
+        };
+        let outcome: string | undefined;
+        let resultText: string | undefined;
+        for (
+          let attempt = 0;
+          attempt <= stabilization.probes && guardsIntact();
+          attempt += 1
+        ) {
+          if (attempt > 0) await delay(stabilization.intervalMs);
+          try {
+            const probe = await options.readSessionOutcome(sessionID);
+            outcome = probe?.outcome;
+            resultText = probe?.resultText;
+          } catch (error) {
+            log('[task-session-manager] host outcome probe failed', {
+              sessionID,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            break;
+          }
+          if (outcome !== 'succeeded') break;
+          if (resultText !== undefined && resultText.length > 0) break;
+        }
+        if (guardsIntact() && isHostTerminalOutcome(outcome)) {
           const settled = options.backgroundJobBoard.updateStatus({
             taskID: sessionID,
             expectedGeneration: observedGeneration,
-            state: outcome === 'succeeded' ? 'completed' : 'error',
-            resultSummary: `Host reported outcome: ${outcome}.`,
+            state:
+              outcome === 'succeeded' && resultText ? 'completed' : 'error',
+            resultSummary:
+              outcome === 'succeeded'
+                ? resultText || COMPLETED_WITHOUT_TEXT_DIAGNOSTIC
+                : `Host reported outcome: ${outcome}.`,
           });
           if (
             settled !== undefined &&
@@ -166,9 +206,10 @@ export function createIdleReconciler(options: {
               '[task-session-manager] confirmed terminal outcome from host session info',
               {
                 sessionID,
-                alias: latest.alias,
-                parentSessionID: latest.parentSessionID,
+                alias: settled.alias,
+                parentSessionID: settled.parentSessionID,
                 outcome,
+                hasResultText: Boolean(resultText),
               },
             );
             return;

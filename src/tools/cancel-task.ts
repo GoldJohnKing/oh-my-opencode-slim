@@ -16,6 +16,7 @@ import {
   getRuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
 } from '../utils/session-runtime-status';
+import { isHostTerminalOutcome } from '../utils/task';
 
 const z = tool.schema;
 
@@ -303,7 +304,10 @@ async function verifyQuiescentViaHostInfo(
       };
       const info = response?.data ?? response;
       const outcome = info?.outcome;
-      if (typeof outcome === 'string' && outcome !== '') {
+      // Whitelist the known terminal values: a malformed or future
+      // nonterminal outcome string must NOT confirm quiescence on its own —
+      // it falls through to the idle-timestamp evidence below.
+      if (typeof outcome === 'string' && isHostTerminalOutcome(outcome)) {
         return;
       }
       const idleAt = info?.time?.idle;

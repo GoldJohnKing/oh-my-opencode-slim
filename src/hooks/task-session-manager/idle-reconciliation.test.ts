@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils';
+import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
 import { createIdleReconciler } from './idle-reconciliation';
 
 async function flushChildIdleReconcile(): Promise<void> {
@@ -8,7 +9,10 @@ async function flushChildIdleReconcile(): Promise<void> {
 
 function createHarness(options?: {
   stopConfirmationGraceMs?: number;
-  readSessionOutcome?: (sessionID: string) => Promise<string | undefined>;
+  readSessionOutcome?: (
+    sessionID: string,
+  ) => Promise<{ outcome?: string; resultText?: string } | undefined>;
+  outcomeStabilization?: { probes: number; intervalMs: number };
 }) {
   const board = new BackgroundJobBoard();
   const terminalListener = mock(() => {});
@@ -29,6 +33,7 @@ function createHarness(options?: {
       prune,
     },
     readSessionOutcome: options?.readSessionOutcome,
+    outcomeStabilization: options?.outcomeStabilization,
   });
   board.registerLaunch({
     taskID: 'child-1',
@@ -123,8 +128,11 @@ describe('idle reconciliation stop confirmation', () => {
 });
 
 describe('host outcome confirmation (v2: no session.status map)', () => {
-  test('quiescent job with host outcome succeeded settles completed and reconciled', async () => {
-    const readSessionOutcome = mock(async () => 'succeeded' as const);
+  test('quiescent job with host outcome succeeded and result text settles completed with the real text', async () => {
+    const readSessionOutcome = mock(
+      async () =>
+        ({ outcome: 'succeeded', resultText: 'Real result summary.' }) as const,
+    );
     const { board, reconciler, terminalListener } = createHarness({
       stopConfirmationGraceMs: 60_000,
       readSessionOutcome,
@@ -134,19 +142,69 @@ describe('host outcome confirmation (v2: no session.status map)', () => {
     await observeIdle(reconciler, 10, generation);
 
     expect(readSessionOutcome).toHaveBeenCalledWith('child-1');
-    expect(board.get('child-1')).toMatchObject({
+    const record = board.get('child-1');
+    expect(record).toMatchObject({
       state: 'reconciled',
       terminalState: 'completed',
       terminalUnreconciled: false,
       statusUncertain: false,
     });
+    expect(record?.resultSummary).toBe('Real result summary.');
     expect(terminalListener).toHaveBeenCalledTimes(1);
+  });
+
+  test('succeeded but textless settles error with the diagnostic after stabilization probes (incident #1115 precedent)', async () => {
+    const readSessionOutcome = mock(
+      async () => ({ outcome: 'succeeded' }) as const,
+    );
+    const { board, reconciler } = createHarness({
+      stopConfirmationGraceMs: 60_000,
+      outcomeStabilization: { probes: 2, intervalMs: 0 },
+      readSessionOutcome,
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    await observeIdle(reconciler, 10, generation);
+
+    expect(readSessionOutcome).toHaveBeenCalledTimes(3); // initial + 2 probes
+    const record = board.get('child-1');
+    expect(record).toMatchObject({
+      state: 'reconciled',
+      terminalState: 'error',
+      terminalUnreconciled: false,
+    });
+    expect(record?.resultSummary).toBe(COMPLETED_WITHOUT_TEXT_DIAGNOSTIC);
+  });
+
+  test('succeeded with text arriving on a later stabilization probe settles completed', async () => {
+    let calls = 0;
+    const readSessionOutcome = mock(async () => {
+      calls += 1;
+      return calls >= 2
+        ? { outcome: 'succeeded', resultText: 'Late but real text.' }
+        : { outcome: 'succeeded' };
+    });
+    const { board, reconciler } = createHarness({
+      stopConfirmationGraceMs: 60_000,
+      outcomeStabilization: { probes: 3, intervalMs: 0 },
+      readSessionOutcome,
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    await observeIdle(reconciler, 10, generation);
+
+    const record = board.get('child-1');
+    expect(record).toMatchObject({
+      state: 'reconciled',
+      terminalState: 'completed',
+    });
+    expect(record?.resultSummary).toBe('Late but real text.');
   });
 
   test('quiescent job with host outcome failed settles error', async () => {
     const { board, reconciler } = createHarness({
       stopConfirmationGraceMs: 60_000,
-      readSessionOutcome: async () => 'failed',
+      readSessionOutcome: async () => ({ outcome: 'failed' }),
     });
     const generation = board.get('child-1')?.generation ?? 1;
 
@@ -167,7 +225,10 @@ describe('host outcome confirmation (v2: no session.status map)', () => {
   test('late busy after idle wins over a stale host outcome probe', async () => {
     const { board, reconciler } = createHarness({
       stopConfirmationGraceMs: 60_000,
-      readSessionOutcome: async () => 'succeeded',
+      readSessionOutcome: async () => ({
+        outcome: 'succeeded',
+        resultText: 'x',
+      }),
     });
     const generation = board.get('child-1')?.generation ?? 1;
 

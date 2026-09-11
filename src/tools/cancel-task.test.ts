@@ -106,6 +106,55 @@ describe('task_cancel tool', () => {
     });
   });
 
+  test('an unrecognized outcome string needs idle evidence to confirm cancellation (v2)', async () => {
+    // P2 review on #1161: only the known terminal outcomes (succeeded/
+    // failed/interrupted) confirm quiescence on their own. A malformed or
+    // future nonterminal value must fall through to the idle-timestamp
+    // evidence instead of blindly confirming the cancel.
+    const run = async (idleAt: number | undefined) => {
+      const board = new BackgroundJobBoard();
+      const abort = mock(async () => ({}));
+      const getSession = mock(async () => ({
+        data: { outcome: 'some-new-nonterminal-value', time: { idle: idleAt } },
+      }));
+      mockClient = {
+        session: { abort, get: getSession, delete: mock(async () => ({})) },
+      };
+      const tools = createCancelTaskTool({
+        input: { directory: '/test/project' } as any,
+        backgroundJobBoard: board,
+        shouldManageSession: () => true,
+        verifyAbortMs: 10,
+        abortRetryIntervalMs: 0,
+        stableStoppedMs: 0,
+      });
+      board.registerLaunch({
+        taskID: 'ses_1',
+        parentSessionID: 'parent-1',
+        agent: 'explorer',
+      });
+      return tools.task_cancel.execute(
+        { task_id: 'ses_1', reason: 'obsolete' },
+        context,
+      );
+    };
+
+    // Fresh idle timestamp (at/after abort) → confirmed via idle evidence.
+    const confirmed = await run(Date.now() + 5_000);
+    expect(parseTaskStatusOutput(String(confirmed))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'cancelled',
+    });
+
+    // Stale idle timestamp → cannot verify → the cancel surfaces the
+    // uncertain-running result instead of confirming.
+    const unverified = await run(Date.now() - 60_000);
+    expect(parseTaskStatusOutput(String(unverified))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'running',
+    });
+  });
+
   test('retains the session and leaves it resumable after acknowledgement', async () => {
     const { board, deleteSession, taskCancel } = createTool();
     board.registerLaunch({
