@@ -6,6 +6,7 @@ import type {
 } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
+import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { getClient } from '../../utils/opencode-client';
 import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
 
@@ -318,7 +319,14 @@ export function createRevivedRunTracker(options: {
             query: { directory: options.input.directory },
             body: {
               agent: 'orchestrator',
-              parts: [{ type: 'text', synthetic: true, text }],
+              // Internal-initiator part (synthetic flag + metadata + marker):
+              // the v2 client-shim routes these through session.synthetic so
+              // the notification stays machine-context instead of a visible
+              // user message, and the session-prompt bridge classifies the
+              // admission as internal (not external user activity). A bare
+              // `synthetic: true` part loses its flag in the flat v2 prompt
+              // translation (#1157).
+              parts: [createInternalAgentTextPart(text)],
             },
           }),
       );

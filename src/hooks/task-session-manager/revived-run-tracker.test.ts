@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils/internal-initiator';
 import { createRevivedRunTracker } from './revived-run-tracker';
 
 function createHarness(
@@ -123,9 +124,27 @@ describe('revived run tracker', () => {
       path: { id: 'parent' },
       body: {
         agent: 'orchestrator',
-        parts: [{ type: 'text', synthetic: true }],
+        // The notification part must carry the internal-initiator metadata
+        // (and marker suffix) so the v2 client-shim routes it through
+        // session.synthetic — a bare `synthetic: true` part drops its flag
+        // in the flat prompt translation and regresses into a visible
+        // user message + external-user-activity classification (#1157).
+        parts: [
+          {
+            type: 'text',
+            synthetic: true,
+            metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+          },
+        ],
       },
     });
+    const notifiedText = (
+      harness.prompt.mock.calls[0]?.[0] as
+        | { body?: { parts?: Array<{ text?: string }> } }
+        | undefined
+    )?.body?.parts?.[0]?.text;
+    expect(notifiedText).toContain('<task ');
+    expect(notifiedText).toContain(SLIM_INTERNAL_INITIATOR_MARKER);
   });
 
   test('keeps a non-terminal idle turn running and rejects historical output', async () => {
