@@ -14,13 +14,17 @@ import {
   parseTaskStateFromOutput,
   recordBackgroundJobSuppression,
 } from '../../utils';
+import { extractChildTerminalEvidence } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { getClient } from '../../utils/opencode-client';
 
 /** Extract the final assistant text from a child session transcript
  * (v1-shaped {data:[{info,parts}]} via the client shim's messages). Used
  * by the quiescent-outcome settle path so completed jobs reconcile with a
- * usable result summary instead of a placeholder. */
+ * usable result summary instead of a placeholder. Delegates to the shared
+ * extractor; the v2 shim shape drops `info.time`, so the strict
+ * completion-time requirement is off (terminality is confirmed via the
+ * host outcome gate before this runs). */
 async function readFinalAssistantText(
   client: ReturnType<typeof getClient>,
   sessionID: string,
@@ -28,32 +32,20 @@ async function readFinalAssistantText(
 ): Promise<string | undefined> {
   if (typeof client.session?.messages !== 'function') return undefined;
   try {
-    const response = (await client.session.messages({
+    const response = await client.session.messages({
       path: { id: sessionID },
       query: { directory },
-    })) as { data?: unknown };
-    const list = Array.isArray(response?.data) ? response.data : [];
-    for (let i = list.length - 1; i >= 0; i -= 1) {
-      const message = isObjectRecord(list[i]) ? list[i] : undefined;
-      const info = isObjectRecord(message?.info) ? message.info : undefined;
-      if (info?.role !== 'assistant') continue;
-      const parts = Array.isArray(message?.parts) ? message.parts : [];
-      const text = parts
-        .filter(
-          (part: unknown) =>
-            isObjectRecord(part) &&
-            part.type === 'text' &&
-            typeof part.text === 'string' &&
-            part.text.length > 0,
-        )
-        .map((part: unknown) => (part as { text: string }).text)
-        .join('\n\n')
-        .trim();
-      // The trailing assistant message decides: text → usable; textless
-      // (e.g. tool-call handoff tail) → let stabilization retry.
-      return text.length > 0 ? text : undefined;
-    }
-    return undefined;
+    });
+    const evidence = extractChildTerminalEvidence(response, {
+      // v2 shim shape: flat {id, role} info without time/finish.
+      requireCompletionTime: false,
+      // v2 sessions can end with structurally valid non-assistant tails
+      // (synthetic/system/skill); the result lives in the last assistant
+      // message, so scan back to it instead of requiring an assistant
+      // tail.
+      scanBackToLastAssistant: true,
+    });
+    return evidence.kind === 'ready' ? evidence.text : undefined;
   } catch {
     return undefined;
   }

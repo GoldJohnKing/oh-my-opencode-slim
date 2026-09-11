@@ -6,6 +6,7 @@ import type {
 } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
+import { extractChildTerminalEvidence } from '../../utils/child-transcript';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { getClient } from '../../utils/opencode-client';
 import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
@@ -172,52 +173,34 @@ export function createRevivedRunTracker(options: {
       return false;
     }
 
-    const data =
-      isRecord(response) && Array.isArray(response.data)
-        ? (response.data as SessionMessage[])
-        : [];
-    const baselineIndex = run.baselineMessageID
-      ? data.findIndex((message) => message.info?.id === run.baselineMessageID)
-      : -1;
-    if (run.baselineMessageID && baselineIndex < 0) return false;
-
-    const lastIndex = data.length - 1;
-    const last = data[lastIndex];
-    if (last?.info?.role !== 'assistant') return false;
-    if (lastIndex <= baselineIndex) return false;
-    if (typeof last.info.time?.completed !== 'number') return false;
-    if (last.info.finish === 'tool-calls' || last.info.finish === 'unknown') {
-      return false;
-    }
-    if (hasPendingToolCall(data, baselineIndex)) return false;
-    if (last.info.error !== undefined) {
-      const result = errorText(last.info.error);
-      const updated = options.backgroundJobBoard.updateStatus({
-        taskID: run.taskID,
-        expectedGeneration: run.generation,
-        state: 'error',
-        resultSummary: result || 'Revived child session failed.',
-      });
-      return updated?.generation === run.generation && finish(run, updated);
-    }
-    const text = (last.parts ?? [])
-      .filter(
-        (part) =>
-          part.type === 'text' &&
-          typeof part.text === 'string' &&
-          part.text.length > 0,
-      )
-      .map((part) => part.text as string)
-      .join('\n\n')
-      .trim();
-    if (text.length > 0) {
-      const updated = options.backgroundJobBoard.updateStatus({
-        taskID: run.taskID,
-        expectedGeneration: run.generation,
-        state: 'completed',
-        resultSummary: text,
-      });
-      return updated?.generation === run.generation && finish(run, updated);
+    const evidence = extractChildTerminalEvidence(response, {
+      baselineMessageID: run.baselineMessageID,
+    });
+    switch (evidence.kind) {
+      case 'no-new-messages':
+      case 'no-assistant':
+      case 'pending':
+        return false;
+      case 'error': {
+        const updated = options.backgroundJobBoard.updateStatus({
+          taskID: run.taskID,
+          expectedGeneration: run.generation,
+          state: 'error',
+          resultSummary: evidence.errorText || 'Revived child session failed.',
+        });
+        return updated?.generation === run.generation && finish(run, updated);
+      }
+      case 'ready': {
+        const updated = options.backgroundJobBoard.updateStatus({
+          taskID: run.taskID,
+          expectedGeneration: run.generation,
+          state: 'completed',
+          resultSummary: evidence.text,
+        });
+        return updated?.generation === run.generation && finish(run, updated);
+      }
+      case 'textless':
+        break;
     }
 
     if (run.stabilizationProbes >= maxStabilizationProbes) {
@@ -479,19 +462,6 @@ function terminalOutcome(
   return record.state === 'completed' || record.state === 'error'
     ? record.state
     : undefined;
-}
-
-function hasPendingToolCall(
-  messages: SessionMessage[],
-  baselineIndex: number,
-): boolean {
-  return messages.slice(baselineIndex + 1).some((message) =>
-    (message.parts ?? []).some((part) => {
-      if (part.type !== 'tool') return false;
-      const status = part.state?.status;
-      return status !== 'completed' && status !== 'error';
-    }),
-  );
 }
 
 function responseError(response: unknown): unknown {
