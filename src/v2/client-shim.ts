@@ -310,13 +310,30 @@ export function buildPluginInput(
           modelSwitch?: 'required';
         },
       ) => {
-        if (!s.prompt) {
-          throw new Error('[v2] session.prompt unavailable for promptAsync');
-        }
         const delivery = args?.delivery === 'queue' ? 'queue' : 'steer';
         const body = (args?.body ?? {}) as Parameters<
           typeof modelRefFromBody
         >[0] & { parts?: Array<{ type?: string; text?: string }> };
+        const metadata = internalInitiatorMetadataFromBody(args);
+        // Internal-initiator injections (orchestrator-wake nudges, interview
+        // continuation) must not be persisted as user input on v2: the flat
+        // session.prompt translation drops the v1 part-level `synthetic`
+        // flag, which regressed them into visible user bubbles. v2's
+        // dedicated session.synthetic admission keeps the text model-visible
+        // while skipping user-message persistence, and its default `resume`
+        // preserves the wake semantics. Hosts without session.synthetic
+        // keep the pre-fix prompt path (visible wake, metadata intact).
+        const internalViaSynthetic =
+          metadata !== undefined && typeof s.synthetic === 'function';
+        if (!s.prompt && !internalViaSynthetic) {
+          throw new Error('[v2] session.prompt unavailable for promptAsync');
+        }
+        if (metadata !== undefined && !internalViaSynthetic) {
+          log(
+            '[v2][shim] session.synthetic unavailable; internal wake admitted as a visible prompt',
+            { id: sessionIDOf(args) },
+          );
+        }
         const ref = modelRefFromBody(body);
         let switched = false;
         if (ref) {
@@ -348,9 +365,23 @@ export function buildPluginInput(
             );
           }
         }
+        if (internalViaSynthetic) {
+          const result = await s.synthetic?.({
+            sessionID: sessionIDOf(args),
+            text: textFromBody(args),
+            description: 'oh-my-opencode-slim internal initiator',
+            ...(metadata ? { metadata } : {}),
+            delivery,
+            resume: true,
+          });
+          // `switched` reports whether the requested model switch was
+          // CONFIRMED — same contract as the prompt path below.
+          return isRecord(result) ? { ...result, switched } : { switched };
+        }
         const files = filesFromBody(args);
-        const metadata = internalInitiatorMetadataFromBody(args);
-        const result = await s.prompt({
+        // Reachable only when s.prompt exists (the guard above throws
+        // otherwise and internalViaSynthetic returned early).
+        const result = await s.prompt?.({
           sessionID: sessionIDOf(args),
           text: textFromBody(args),
           delivery,
