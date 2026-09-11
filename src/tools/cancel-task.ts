@@ -16,6 +16,7 @@ import {
   getRuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
 } from '../utils/session-runtime-status';
+import { isHostTerminalOutcome } from '../utils/task';
 
 const z = tool.schema;
 
@@ -187,6 +188,7 @@ async function abortAndVerifySession(
 ): Promise<void> {
   assertLease(options.backgroundJobBoard, lease, execution);
   const taskID = execution.taskID;
+  const abortStartedAt = Date.now();
   let response: unknown;
   try {
     response = await awaitLeaseOperation(
@@ -207,19 +209,21 @@ async function abortAndVerifySession(
     throw new Error(`Session abort was not confirmed: ${taskID}`);
   }
 
-  await verifyQuiescentSession(options, execution, lease);
+  await verifyQuiescentSession(options, execution, lease, abortStartedAt);
 }
 
 async function verifyQuiescentSession(
   options: TaskControlToolOptions,
   execution: CapturedExecution,
   lease: BackgroundJobLease,
+  abortStartedAt: number,
 ): Promise<void> {
   const deadline = Date.now() + (options.verifyAbortMs ?? 1_500);
   const stableStoppedMs = options.stableStoppedMs ?? 300;
   const retryIntervalMs = options.abortRetryIntervalMs ?? 150;
   let stableStoppedSince: number | undefined;
   let lastStatus: string | undefined;
+  let statusUnavailable = false;
 
   while (Date.now() <= deadline) {
     assertLease(options.backgroundJobBoard, lease, execution);
@@ -231,6 +235,13 @@ async function verifyQuiescentSession(
       options.backgroundJobBoard,
     );
     assertLease(options.backgroundJobBoard, lease, execution);
+    if (status.source === 'status-unavailable') {
+      // v2 hosts expose no session.status map; polling it can never answer
+      // 'idle'. Fall back to host session info (terminal outcome or a
+      // fresh idle timestamp) instead of failing a confirmed abort.
+      statusUnavailable = true;
+      break;
+    }
     lastStatus = status.status;
     const quiescent = status.status === 'idle';
     if (!quiescent) {
@@ -243,8 +254,79 @@ async function verifyQuiescentSession(
     await delay(retryIntervalMs);
   }
 
+  if (statusUnavailable) {
+    await verifyQuiescentViaHostInfo(
+      options,
+      execution,
+      lease,
+      abortStartedAt,
+      deadline,
+    );
+    return;
+  }
+
   throw new SessionStillRunningError(
     `Session abort returned but task did not stay stopped: ${execution.taskID} (${lastStatus ?? 'unknown'})`,
+  );
+}
+
+/**
+ * v2 verification fallback: the host publishes the terminal outcome and an
+ * idle timestamp on Session.Info. Quiescence is confirmed by either a
+ * terminal outcome or an idle timestamp at/after the abort began.
+ */
+async function verifyQuiescentViaHostInfo(
+  options: TaskControlToolOptions,
+  execution: CapturedExecution,
+  lease: BackgroundJobLease,
+  abortStartedAt: number,
+  deadline: number,
+): Promise<void> {
+  const retryIntervalMs = options.abortRetryIntervalMs ?? 150;
+  let lastDetail = 'no host session info';
+  while (Date.now() <= deadline) {
+    assertLease(options.backgroundJobBoard, lease, execution);
+    const client = getClient(options.input);
+    if (typeof client.session.get !== 'function') {
+      // No status map AND no session info — nothing to verify against.
+      throw new SessionStillRunningError(
+        `Session abort returned but quiescence cannot be verified on this host: ${execution.taskID}`,
+      );
+    }
+    try {
+      const response = (await client.session.get({
+        path: { id: execution.taskID },
+        query: { directory: options.input.directory },
+      })) as {
+        data?: { outcome?: unknown; time?: { idle?: unknown } };
+        outcome?: unknown;
+        time?: { idle?: unknown };
+      };
+      const info = response?.data ?? response;
+      const outcome = info?.outcome;
+      // Whitelist the known terminal values: a malformed or future
+      // nonterminal outcome string must NOT confirm quiescence on its own —
+      // it falls through to the idle-timestamp evidence below.
+      if (typeof outcome === 'string' && isHostTerminalOutcome(outcome)) {
+        return;
+      }
+      const idleAt = info?.time?.idle;
+      if (typeof idleAt === 'number' && idleAt >= abortStartedAt) {
+        return;
+      }
+      lastDetail =
+        typeof outcome === 'string'
+          ? `outcome=${outcome}`
+          : typeof idleAt === 'number'
+            ? `idle=${idleAt}`
+            : 'no outcome or idle timestamp';
+    } catch (error) {
+      lastDetail = error instanceof Error ? error.message : String(error);
+    }
+    await delay(retryIntervalMs);
+  }
+  throw new SessionStillRunningError(
+    `Session abort returned but task did not stay stopped: ${execution.taskID} (host-info: ${lastDetail})`,
   );
 }
 
@@ -260,6 +342,16 @@ async function getSessionStatus(
     generation: lease.generation,
   });
   try {
+    // Capability pre-check: v2 hosts expose no session.status map. Detect
+    // that deterministically (instead of relying on the thrown lookup
+    // error) so the verification loop can switch to the host-info path.
+    const client =
+      typeof input.client?.session?.status === 'function'
+        ? input.client
+        : getClient(input);
+    if (typeof client.session?.status !== 'function') {
+      return { status: undefined, source: 'status-unavailable' };
+    }
     const snapshot = await awaitLeaseOperation(
       backgroundJobBoard,
       lease,

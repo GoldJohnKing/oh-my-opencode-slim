@@ -14,7 +14,43 @@ import {
   parseTaskStateFromOutput,
   recordBackgroundJobSuppression,
 } from '../../utils';
+import { extractChildTerminalEvidence } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
+import { getClient } from '../../utils/opencode-client';
+
+/** Extract the final assistant text from a child session transcript
+ * (v1-shaped {data:[{info,parts}]} via the client shim's messages). Used
+ * by the quiescent-outcome settle path so completed jobs reconcile with a
+ * usable result summary instead of a placeholder. Delegates to the shared
+ * extractor; the v2 shim shape drops `info.time`, so the strict
+ * completion-time requirement is off (terminality is confirmed via the
+ * host outcome gate before this runs). */
+async function readFinalAssistantText(
+  client: ReturnType<typeof getClient>,
+  sessionID: string,
+  directory: string,
+): Promise<string | undefined> {
+  if (typeof client.session?.messages !== 'function') return undefined;
+  try {
+    const response = await client.session.messages({
+      path: { id: sessionID },
+      query: { directory },
+    });
+    const evidence = extractChildTerminalEvidence(response, {
+      // v2 shim shape: flat {id, role} info without time/finish.
+      requireCompletionTime: false,
+      // v2 sessions can end with structurally valid non-assistant tails
+      // (synthetic/system/skill); the result lives in the last assistant
+      // message, so scan back to it instead of requiring an assistant
+      // tail.
+      scanBackToLastAssistant: true,
+    });
+    return evidence.kind === 'ready' ? evidence.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -271,6 +307,39 @@ export function createTaskSessionManagerHook(
     isCurrentIdleSessionToken: (s, t) => isCurrentIdleSessionToken(s, t),
     taskContextTracker,
     revivedRunTracker: options.revivedRunTracker,
+    // v2: no live session-status map exists, but Session.Info.outcome
+    // publishes the terminal transition — use it to settle quiescent jobs
+    // to their accurate terminal state (v1 hosts keep the status-map
+    // confirmation and simply never hit this probe).
+    readSessionOutcome: async (sessionID) => {
+      try {
+        const client = getClient(_ctx);
+        if (typeof client.session?.get !== 'function') return undefined;
+        const response = (await client.session.get({
+          path: { id: sessionID },
+          query: { directory: _ctx.directory },
+        })) as {
+          data?: { outcome?: unknown };
+          outcome?: unknown;
+        };
+        const info = response?.data ?? response;
+        const outcome = info?.outcome;
+        if (typeof outcome !== 'string') return undefined;
+        if (outcome !== 'succeeded') return { outcome };
+        // Usable-result requirement (#1115 precedent): a completed job is
+        // only reconciled with its final assistant text. Extract it from
+        // the transcript; absent text falls back to the reconciler's
+        // stabilization probes.
+        const resultText = await readFinalAssistantText(
+          client,
+          sessionID,
+          _ctx.directory,
+        );
+        return { outcome, resultText };
+      } catch {
+        return undefined;
+      }
+    },
   });
   const runtimeStatusReconciler = createRuntimeStatusReconciler({
     input: _ctx,
