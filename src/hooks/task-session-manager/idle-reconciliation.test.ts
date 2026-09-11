@@ -7,6 +7,21 @@ async function flushChildIdleReconcile(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
+/** Poll the board until the predicate holds (bounded) — CI runners can be
+ * slower than the fixed 5ms flush, and the stabilization loop needs extra
+ * macrotask hops (delay(0) per probe). */
+async function waitForBoardRecord(
+  board: BackgroundJobBoard,
+  predicate: (record: { state: string } | undefined) => boolean,
+  timeoutMs = 500,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate(board.get('child-1'))) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 function createHarness(options?: {
   stopConfirmationGraceMs?: number;
   readSessionOutcome?: (
@@ -140,6 +155,7 @@ describe('host outcome confirmation (v2: no session.status map)', () => {
     const generation = board.get('child-1')?.generation ?? 1;
 
     await observeIdle(reconciler, 10, generation);
+    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
 
     expect(readSessionOutcome).toHaveBeenCalledWith('child-1');
     const record = board.get('child-1');
@@ -165,6 +181,7 @@ describe('host outcome confirmation (v2: no session.status map)', () => {
     const generation = board.get('child-1')?.generation ?? 1;
 
     await observeIdle(reconciler, 10, generation);
+    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
 
     expect(readSessionOutcome).toHaveBeenCalledTimes(3); // initial + 2 probes
     const record = board.get('child-1');
@@ -192,6 +209,7 @@ describe('host outcome confirmation (v2: no session.status map)', () => {
     const generation = board.get('child-1')?.generation ?? 1;
 
     await observeIdle(reconciler, 10, generation);
+    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
 
     const record = board.get('child-1');
     expect(record).toMatchObject({
@@ -209,6 +227,7 @@ describe('host outcome confirmation (v2: no session.status map)', () => {
     const generation = board.get('child-1')?.generation ?? 1;
 
     await observeIdle(reconciler, 10, generation);
+    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
 
     const record = board.get('child-1');
     expect(record).toMatchObject({
