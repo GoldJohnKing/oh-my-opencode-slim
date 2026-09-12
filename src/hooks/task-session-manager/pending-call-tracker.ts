@@ -186,6 +186,12 @@ export function createPendingCallTracker(
       ownerBoard?: BackgroundJobStore,
       takeOptions?: { recordConsumed?: boolean },
     ) {
+      // Set for a no-callId sole-survivor take on a parent whose
+      // unresolved window is armed; the flag is applied only after the
+      // fence checks below confirm this take actually consumes the
+      // pending (a fenced take returns without consuming and must not
+      // stain the pending for its owning generation).
+      let unresolvedWindowTake = false;
       if (!callId && parentSessionId) {
         // Without a tool call ID a take can only be sound when exactly
         // one pending exists for the parent. "A sole survivor belongs
@@ -203,11 +209,9 @@ export function createPendingCallTracker(
         callId = sole;
         // Window-shift propagation: an unresolved drain earlier in this
         // parent's burst means "sole survivor belongs to this call" no
-        // longer proves identity — flag the taken pending unresolved.
-        if (unresolvedDrainParents.has(parentSessionId)) {
-          const solePending = pendingCalls.get(sole);
-          if (solePending) solePending.identityUnresolved = true;
-        }
+        // longer proves identity — the consumed pending is flagged
+        // unresolved below.
+        unresolvedWindowTake = unresolvedDrainParents.has(parentSessionId);
       }
       if (!callId) return undefined;
       const pending = pendingCalls.get(callId);
@@ -219,6 +223,9 @@ export function createPendingCallTracker(
         return undefined;
       }
       pendingCalls.delete(callId);
+      if (pending && unresolvedWindowTake) {
+        pending.identityUnresolved = true;
+      }
       if (pending && takeOptions?.recordConsumed !== false) {
         recordConsumed(pending);
       }
@@ -411,8 +418,15 @@ export function createPendingCallTracker(
               taskID: registration.taskID,
               parentSessionID: pending.parentSessionId,
               agent: pending.agentType,
-              description: pending.label,
-              objective: pending.fullObjective ?? pending.label,
+              // Never paint call-specific metadata from an unresolved
+              // identity (mirrors registerTaskOutputLaunch): a flagged
+              // pending falls back to the board's generic description.
+              ...(pending.identityUnresolved
+                ? {}
+                : {
+                    description: pending.label,
+                    objective: pending.fullObjective ?? pending.label,
+                  }),
               background: false,
               preserveRun: true,
             });
