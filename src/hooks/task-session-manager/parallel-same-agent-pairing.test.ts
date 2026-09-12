@@ -334,27 +334,119 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
     // Ticket A was bound to sA and released on the terminal status —
     // only B's admission slot remains held.
     expect(concurrency.snapshot()).toEqual({ active: 1, queued: 0 });
-    // The board record carries the authoritative task ID from A's own
-    // output, with A's label (placeholder corrected).
-    expect(board.get(sA)?.description).toBe(L_A);
+    // The board record keeps everything output-authoritative (task ID,
+    // state, result text from A's own output), but the drained pending
+    // was consumed without verified identity — its label/objective may
+    // belong to sibling B — so the metadata floor applies: the record
+    // keeps the honest placeholder instead of a possibly-wrong label.
+    expect(board.get(sA)?.description).toBe('unattributed oracle task');
     expect(board.get(sA)?.state).toBe('completed');
+    expect(board.get(sA)?.resultSummary).toBe('Review finished.');
 
     // after B resolves through the normal sole-survivor take — the
-    // burst did not strand anything or poison the parent.
+    // burst did not strand anything or poison the parent. The take is
+    // still flagged: A's unresolved drain shifted the sole-survivor
+    // window, so B's label cannot be trusted either.
     await hook['tool.execute.after'](
       { tool: 'task', sessionID: PARENT },
       { output: completed(sB) },
     );
-    expect(board.get(sB)?.description).toBe(L_B);
+    expect(board.get(sB)?.description).toBe('unattributed oracle task');
+    expect(board.get(sB)?.state).toBe('completed');
+    expect(board.get(sB)?.resultSummary).toBe('Review finished.');
     expect(concurrency.snapshot()).toEqual({ active: 0, queued: 0 });
 
     // A subsequent no-ID call for this parent still works end-to-end.
+    // The parent's unresolved window persists for the session, so the
+    // sole take is flagged as well; with no placeholder record for sC
+    // the fresh registration falls back to registerLaunch's generic
+    // default label.
     await hook['tool.execute.before'](...noIDBefore(L_C));
     await hook['tool.execute.after'](
       { tool: 'task', sessionID: PARENT },
       { output: HOST_LAUNCH(sC) },
     );
-    expect(board.get(sC)?.description).toBe(L_C);
+    expect(board.get(sC)?.description).toBe('background oracle task');
+  });
+
+  test('eviction variant: pre-consumed pending degrades the burst without corrupting it (B)', async () => {
+    const board = new BackgroundJobBoard();
+    const tracker = createPendingCallTracker();
+    const hook = createHook(board, { pendingCallTracker: tracker });
+    const sA = 'ses_aaaa1111';
+    const sB = 'ses_bbbb2222';
+    const sC = 'ses_dddd4444';
+    const completed = (taskID: string) =>
+      [
+        `task_id: ${taskID}`,
+        'state: completed',
+        '',
+        '<task_result>',
+        'Review finished.',
+        '</task_result>',
+      ].join('\n');
+    const noIDBefore = (description: string) =>
+      [
+        { tool: 'task', sessionID: PARENT },
+        {
+          args: {
+            subagent_type: 'oracle',
+            description,
+            prompt: 'do the review',
+            background: true,
+          },
+        },
+      ] as const;
+
+    // Burst of three no-ID, no-title calls; the pending cap evicts the
+    // oldest pending (its ticket was released at eviction —
+    // pre-existing behavior) before any after-hook fires.
+    await hook['tool.execute.before'](...noIDBefore(L_A));
+    await hook['tool.execute.before'](...noIDBefore(L_B));
+    await hook['tool.execute.before'](...noIDBefore(L_C));
+    tracker.take('parent-1:anonymous-1');
+
+    // No-title children are ambiguous → placeholders claim no pending.
+    await hook.event(created({ child: sA }));
+    await hook.event(created({ child: sB }));
+    await hook.event(created({ child: sC }));
+    expect(board.get(sA)?.description).toBe('unattributed oracle task');
+    expect(board.get(sB)?.description).toBe('unattributed oracle task');
+    expect(board.get(sC)?.description).toBe('unattributed oracle task');
+
+    // The evicted call's late after-hook: two pendings remain, so
+    // take() refuses and the drain fallback consumes B's pending —
+    // flagged unresolved, so sA never receives a sibling label.
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: completed(sA) },
+    );
+    expect(board.get(sA)?.description).toBe('unattributed oracle task');
+    expect(board.get(sA)?.state).toBe('completed');
+    expect(board.get(sA)?.resultSummary).toBe('Review finished.');
+
+    // The sibling's after steals the shifted window (sole survivor C,
+    // armed by the drain) — flagged too, so sB also stays generic.
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: completed(sB) },
+    );
+    expect(board.get(sB)?.description).toBe('unattributed oracle task');
+    expect(board.get(sB)?.state).toBe('completed');
+    expect(board.get(sB)?.resultSummary).toBe('Review finished.');
+
+    // C's own after arrives last: no pending remains (its pending was
+    // consumed by B's window-shifted take), so its output drains
+    // nothing and drops. The cascade terminates degraded — sC keeps
+    // its honest placeholder instead of a stolen or poisoned record —
+    // and nothing is stranded.
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: completed(sC) },
+    );
+    expect(board.get(sC)?.description).toBe('unattributed oracle task');
+    expect(board.get(sC)?.state).toBe('running');
+    expect(tracker.peekByParent(PARENT)).toBeUndefined();
   });
 
   test('B1 drain fallback logs exactly one deterministic warning per burst', async () => {

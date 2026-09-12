@@ -305,4 +305,70 @@ describe('takeUnresolvedFirstMatch', () => {
       tracker.takeUnresolvedFirstMatch('parent-1', { identityTaskID: 'ses_x' }),
     ).toBeUndefined();
   });
+
+  test('flags the drained call unresolved and arms the parent window', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    const taken = tracker.takeUnresolvedFirstMatch('parent-1', {
+      identityTaskID: 'ses_x',
+    });
+
+    expect(taken?.callId).toBe('a');
+    expect(taken?.identityUnresolved).toBe(true);
+
+    // Window-shift propagation: the later no-callId sole take for the
+    // same parent is flagged too — "sole survivor" no longer proves
+    // identity once an unresolved drain shifted the ordering argument.
+    const sole = tracker.take(undefined, 'parent-1');
+    expect(sole?.callId).toBe('b');
+    expect(sole?.identityUnresolved).toBe(true);
+  });
+
+  test('armed window never flags a claim-verified takeByTaskID take', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', earlyRegisteredTaskID: 'ses_claimed' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    // Drain the unmarked pending (a is fenced by its early-registration
+    // claim), arming the parent's unresolved window.
+    expect(
+      tracker.takeUnresolvedFirstMatch('parent-1', {
+        identityTaskID: 'ses_x',
+      })?.callId,
+    ).toBe('b');
+
+    // A takeByTaskID take is identity-verified by the early
+    // registration's claim: no unresolved flag.
+    const claimed = tracker.takeByTaskID('parent-1', 'ses_claimed');
+    expect(claimed?.callId).toBe('a');
+    expect(claimed?.identityUnresolved).toBeUndefined();
+  });
+
+  test('clearSession resets the unresolved window for that parent', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+    tracker.takeUnresolvedFirstMatch('parent-1', { identityTaskID: 'ses_x' });
+
+    tracker.clearSession('parent-1');
+
+    // A fresh pending in the cleared window resolves normally.
+    tracker.add(pending({ callId: 'b' }));
+    const sole = tracker.take(undefined, 'parent-1');
+    expect(sole?.callId).toBe('b');
+    expect(sole?.identityUnresolved).toBeUndefined();
+  });
+
+  test('clearAll resets every unresolved window', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', parentSessionId: 'parent-1' }));
+    tracker.takeUnresolvedFirstMatch('parent-1', { identityTaskID: 'ses_x' });
+
+    tracker.clearAll();
+
+    tracker.add(pending({ callId: 'b', parentSessionId: 'parent-1' }));
+    const sole = tracker.take(undefined, 'parent-1');
+    expect(sole?.identityUnresolved).toBeUndefined();
+  });
 });

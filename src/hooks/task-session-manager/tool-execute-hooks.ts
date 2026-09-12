@@ -584,13 +584,29 @@ function registerTaskOutputLaunch(
     );
   }
 
+  if (pending.identityUnresolved) {
+    log(
+      '[task-session-manager] registered authoritative task ID with generic metadata (identity unresolved)',
+      { taskID, callID: pending.callId },
+    );
+  }
+
   try {
     return deps.backgroundJobBoard.registerLaunch({
       taskID,
       parentSessionID: pending.parentSessionId,
       agent: pending.agentType,
-      description: pending.label,
-      objective: pending.fullObjective ?? pending.label,
+      // Identity was unresolved (no-ID drain or window-shifted take):
+      // the label/objective may belong to a sibling call, so never
+      // paint them. Existing placeholder records keep their honest
+      // description; fresh records fall back to registerLaunch's
+      // generic default.
+      ...(pending.identityUnresolved
+        ? {}
+        : {
+            description: pending.label,
+            objective: pending.fullObjective ?? pending.label,
+          }),
       background: exactCallConfirmed && pending.background,
       preserveRun:
         pending.earlyRegisteredTaskID === taskID ||
