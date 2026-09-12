@@ -53,15 +53,6 @@ The main idea is simple: instead of forcing one model to do everything, the plug
   overrides, per-agent skill/MCP permissions, and
   [project-local customization](docs/project-local-customization.md).
 
-### OpenAI GPT-5.6
-
-<p align="center">
-  <img src="img/openai-gpt-5-6-pantheon.jpeg" alt="OpenAI GPT-5.6 Pantheon: Terra, Sol, and Luna" width="100%">
-</p>
-
-The default [OpenAI preset](docs/openai-preset.md) maps Terra to Orchestrator,
-Sol to Oracle, and Luna to the fast specialist lanes.
-
 ### What Users Say
 
 > “Task management went from 5/10 to 8-9/10 easily. The Orchestrator sends
