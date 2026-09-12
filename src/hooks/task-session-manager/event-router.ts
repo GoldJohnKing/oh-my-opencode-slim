@@ -205,6 +205,7 @@ export async function handleEvent(
           id?: string;
           parentID?: string;
           agent?: string;
+          title?: string;
           generation?: number;
           activityAt?: number;
           timestamp?: number;
@@ -274,6 +275,7 @@ export async function handleEvent(
       peekByParentAndAgent(
         parentSessionID: string,
         agentHint?: string,
+        title?: string,
       ): PendingTaskCall | undefined;
       clearSession(sessionID: string): void;
       clearAll?(): void;
