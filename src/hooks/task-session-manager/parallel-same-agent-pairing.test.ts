@@ -159,14 +159,15 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
     expect(board.get(sC)?.description).toBe(L_C);
   });
 
-  test('cross-marked pending never drops the authoritative task ID', async () => {
+  test('stale no-title created event cannot cross-mark or misattribute', async () => {
     const board = new BackgroundJobBoard();
     const hook = createHook(board);
     const sA = 'ses_aaaa1111';
     const sX = 'ses_xxxx9999';
     const sB = 'ses_bbbb2222';
 
-    // call A completes before its created event: after-hook registers sA
+    // call A completes before its created event: after-hook consumes its
+    // pending and registers sA
     await hook['tool.execute.before'](
       ...beforeCall({ callID: 'call-a', description: L_A }),
     );
@@ -174,23 +175,25 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
       ...afterCall({ callID: 'call-a', taskID: sA }),
     );
 
-    // call B still pending; a child with no title (v1-style) arrives whose
-    // owning pending (A) is already consumed — the unique-agent fallback
-    // claims pending B for the wrong child (cross-mark)
+    // call B still pending; a late no-title (v1-style) child whose owning
+    // call was already consumed must not claim pending B — it gets a
+    // placeholder instead of B's label, so no cross-mark can form
     await hook['tool.execute.before'](
       ...beforeCall({ callID: 'call-b', description: L_B }),
     );
     await hook.event(created({ child: sX }));
-    expect(board.get(sX)?.description).toBe(L_B);
+    expect(board.get(sX)?.description).toBe('unattributed oracle task');
 
-    // after(B) parses sB from its own output; the cross-mark on pending B
-    // (earlyRegisteredTaskID = sX) must not cause sB to be dropped
+    // after(B) parses sB from its own output; pending B was never
+    // cross-marked, so sB registers cleanly with the right label
     await hook['tool.execute.after'](
       ...afterCall({ callID: 'call-b', taskID: sB }),
     );
 
     expect(board.taskIDs()).toEqual(new Set([sA, sX, sB]));
     expect(board.get(sB)?.description).toBe(L_B);
-    expect(board.get(sX)?.description).toBe(L_B);
+    expect(board.get(sA)?.description).toBe(L_A);
+    // the stale child keeps the honest placeholder label, never B's
+    expect(board.get(sX)?.description).toBe('unattributed oracle task');
   });
 });

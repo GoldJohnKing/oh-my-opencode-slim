@@ -39,6 +39,7 @@ export interface PendingCallTracker {
     callId?: string,
     parentSessionId?: string,
     ownerBoard?: BackgroundJobStore,
+    options?: { recordConsumed?: boolean },
   ): PendingTaskCall | undefined;
   release(call: PendingTaskCall): void;
   peekByParent(parentSessionId: string): PendingTaskCall | undefined;
@@ -47,6 +48,11 @@ export interface PendingCallTracker {
     agentHint?: string,
     title?: string,
   ): PendingTaskCall | undefined;
+  /** True when a pending call for this parent (optionally of the given
+   * agent type) was already consumed by its tool.execute.after. A
+   * no-title session.created that arrives after such consumption may be
+   * a stale child of the consumed call, so claims must be refused. */
+  hasConsumedCall(parentSessionId: string, agentType?: string): boolean;
   adoptEarlyRegistrations(
     backgroundJobBoard: BackgroundJobStore,
     backgroundJobSupervisor?: BackgroundJobSupervisor,
@@ -61,6 +67,41 @@ export function createPendingCallTracker(
 ) {
   const pendingCalls = new Map<string, PendingTaskCall>();
   let anonymousPendingCallId = 0;
+
+  /** Calls already consumed by their tool.execute.after, kept briefly so
+   * late no-title session.created events can be recognized as possibly
+   * stale children of a consumed call instead of claiming an unrelated
+   * pending. */
+  const consumedCalls = new Map<
+    string,
+    { parentSessionId: string; agentType: string }
+  >();
+  const MAX_CONSUMED_CALLS = 200;
+
+  const recordConsumed = (call: PendingTaskCall): void => {
+    consumedCalls.set(call.callId, {
+      parentSessionId: call.parentSessionId,
+      agentType: call.agentType,
+    });
+    while (consumedCalls.size > MAX_CONSUMED_CALLS) {
+      const firstKey = consumedCalls.keys().next().value;
+      if (firstKey === undefined) break;
+      consumedCalls.delete(firstKey);
+    }
+  };
+
+  const hasConsumedFor = (
+    parentSessionId: string,
+    agentType?: string,
+  ): boolean => {
+    for (const consumed of consumedCalls.values()) {
+      if (consumed.parentSessionId !== parentSessionId) continue;
+      if (agentType === undefined || consumed.agentType === agentType) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   const releaseCallLease = (call: PendingTaskCall): void => {
     if (call.relaunchLease) {
@@ -88,6 +129,7 @@ export function createPendingCallTracker(
       callId?: string,
       parentSessionId?: string,
       ownerBoard?: BackgroundJobStore,
+      takeOptions?: { recordConsumed?: boolean },
     ) {
       if (!callId && parentSessionId) {
         for (const id of pendingCalls.keys()) {
@@ -108,6 +150,9 @@ export function createPendingCallTracker(
         return undefined;
       }
       pendingCalls.delete(callId);
+      if (pending && takeOptions?.recordConsumed !== false) {
+        recordConsumed(pending);
+      }
       return pending;
     },
 
@@ -158,16 +203,38 @@ export function createPendingCallTracker(
       if (unmarked.length === 0) return undefined;
 
       if (typeof title === 'string' && title !== '') {
-        const byTitle = unmarked.filter((call) => call.label === title);
+        // Title matching is identity-strong (the host stamps the child
+        // title with the call's description argument), but labels can be
+        // reused across different agents in one parent turn; never claim
+        // a pending whose agent differs from the child session's agent.
+        const byTitle = unmarked.filter(
+          (call) =>
+            call.label === title &&
+            (!agentHint || call.agentType === agentHint),
+        );
         return byTitle.length === 1 ? byTitle[0] : undefined;
       }
 
       if (agentHint) {
         const byAgent = unmarked.filter((call) => call.agentType === agentHint);
-        return byAgent.length === 1 ? byAgent[0] : undefined;
+        if (byAgent.length !== 1) return undefined;
+        // A same-agent call that was already consumed (its after-hook
+        // ran) may be the true owner of this no-title child — its
+        // registration already had its chance, so this event is most
+        // likely stale. Refuse; the caller registers a placeholder.
+        if (hasConsumedFor(parentSessionId, agentHint)) return undefined;
+        return byAgent[0];
       }
 
-      return unmarked.length === 1 ? unmarked[0] : undefined;
+      if (unmarked.length === 1) {
+        if (hasConsumedFor(parentSessionId)) return undefined;
+        return unmarked[0];
+      }
+      return undefined;
+    },
+
+    hasConsumedCall(parentSessionId: string, agentType?: string): boolean {
+      return hasConsumedFor(parentSessionId, agentType);
     },
 
     adoptEarlyRegistrations(
@@ -224,6 +291,11 @@ export function createPendingCallTracker(
         pendingCalls.delete(callId);
         removed.push(pending);
       }
+      for (const [callId, consumed] of consumedCalls.entries()) {
+        if (consumed.parentSessionId === sessionId) {
+          consumedCalls.delete(callId);
+        }
+      }
       // Release queued tickets before active tickets. Releasing an active
       // ticket pumps the scheduler, so doing it in insertion order could
       // admit a later call just as the parent is being deleted.
@@ -232,9 +304,10 @@ export function createPendingCallTracker(
       }
     },
 
-    clearAll() {
+    clearAll(): void {
       const removed = [...pendingCalls.values()].reverse();
       pendingCalls.clear();
+      consumedCalls.clear();
       for (const pending of removed) releaseCallLease(pending);
     },
 

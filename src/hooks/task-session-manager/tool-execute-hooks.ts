@@ -74,7 +74,12 @@ export async function handleToolExecuteBefore(
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
       add(call: PendingTaskCall): void;
-      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      take(
+        callID?: string,
+        sessionID?: string,
+        ownerBoard?: BackgroundJobStore,
+        options?: { recordConsumed?: boolean },
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
       pendingCallId(sessionID?: string, callID?: string): string;
     };
@@ -245,7 +250,14 @@ export async function handleToolExecuteBefore(
       }
     }
   } catch (error) {
-    const tracked = deps.pendingCallTracker.take(pendingCall.callId);
+    const tracked = deps.pendingCallTracker.take(
+      pendingCall.callId,
+      undefined,
+      undefined,
+      {
+        recordConsumed: false,
+      },
+    );
     if (tracked) deps.pendingCallTracker.release?.(tracked);
     else pendingCall.concurrencyTicket?.releaseIfUnbound();
     throw error;
@@ -274,6 +286,7 @@ export async function handleToolExecuteAfter(
         callID?: string,
         sessionID?: string,
         ownerBoard?: BackgroundJobStore,
+        options?: { recordConsumed?: boolean },
       ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };

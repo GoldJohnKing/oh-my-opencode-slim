@@ -82,4 +82,51 @@ describe('peekByParentAndAgent', () => {
 
     expect(hit?.callId).toBe('a');
   });
+
+  test('title match is constrained by the agent hint', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', agentType: 'fixer', label: 'L1' }));
+    tracker.add(pending({ callId: 'b', agentType: 'oracle', label: 'L2' }));
+
+    // The title matches pending b, but the child's agent is fixer: the
+    // oracle pending must not be claimed across agents.
+    const hit = tracker.peekByParentAndAgent('parent-1', 'fixer', 'L2');
+
+    expect(hit).toBeUndefined();
+  });
+
+  test('stale no-title claim is rejected after a same-agent call was consumed', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    // call a's after-hook consumed its pending; a late no-title
+    // session.created may be a's stale child and must not claim b.
+    tracker.take('a');
+
+    expect(tracker.peekByParentAndAgent('parent-1', 'oracle')).toBeUndefined();
+  });
+
+  test('no-title unique-agent claim still works before any consumption', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', agentType: 'oracle' }));
+    tracker.add(pending({ callId: 'b', agentType: 'fixer' }));
+
+    const hit = tracker.peekByParentAndAgent('parent-1', 'oracle');
+
+    expect(hit?.callId).toBe('a');
+  });
+
+  test('consumed-call staleness guard is scoped by agent', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', agentType: 'oracle' }));
+    tracker.add(pending({ callId: 'b', agentType: 'fixer' }));
+
+    tracker.take('a');
+
+    // The consumed oracle call cannot explain a fixer child.
+    const hit = tracker.peekByParentAndAgent('parent-1', 'fixer');
+
+    expect(hit?.callId).toBe('b');
+  });
 });
