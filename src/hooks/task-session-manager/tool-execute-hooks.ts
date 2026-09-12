@@ -74,7 +74,12 @@ export async function handleToolExecuteBefore(
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
       add(call: PendingTaskCall): void;
-      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      take(
+        callID?: string,
+        sessionID?: string,
+        ownerBoard?: BackgroundJobStore,
+        options?: { recordConsumed?: boolean },
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
       pendingCallId(sessionID?: string, callID?: string): string;
     };
@@ -245,7 +250,14 @@ export async function handleToolExecuteBefore(
       }
     }
   } catch (error) {
-    const tracked = deps.pendingCallTracker.take(pendingCall.callId);
+    const tracked = deps.pendingCallTracker.take(
+      pendingCall.callId,
+      undefined,
+      undefined,
+      {
+        recordConsumed: false,
+      },
+    );
     if (tracked) deps.pendingCallTracker.release?.(tracked);
     else pendingCall.concurrencyTicket?.releaseIfUnbound();
     throw error;
@@ -273,6 +285,12 @@ export async function handleToolExecuteAfter(
       take(
         callID?: string,
         sessionID?: string,
+        ownerBoard?: BackgroundJobStore,
+        options?: { recordConsumed?: boolean },
+      ): PendingTaskCall | undefined;
+      takeByTaskID(
+        sessionID: string,
+        taskID: string,
         ownerBoard?: BackgroundJobStore,
       ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
@@ -317,13 +335,33 @@ export async function handleToolExecuteAfter(
     typeof input.callID === 'string' && input.callID.trim() !== ''
       ? input.callID
       : undefined;
-  const pending = deps.pendingCallTracker.take(
+  let pending = deps.pendingCallTracker.take(
     exactCallID,
     exactCallID ? undefined : input.sessionID,
     deps.backgroundJobBoard,
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
+  if (!pending && typeof output.output === 'string') {
+    // No tool call ID (or unknown one): resolve identity via the task
+    // ID parsed from this call's own output, matched against the
+    // pending the early registration claimed for that child. This
+    // avoids guessing by insertion order among parallel calls.
+    const identityTaskID = parseTaskIdFromTaskOutput(output.output);
+    if (identityTaskID && input.sessionID) {
+      pending = deps.pendingCallTracker.takeByTaskID(
+        input.sessionID,
+        identityTaskID,
+        deps.backgroundJobBoard,
+      );
+      if (pending) {
+        log(
+          '[task-session-manager] resolved task output identity via early-registered task ID',
+          { taskID: identityTaskID, callID: pending.callId },
+        );
+      }
+    }
+  }
   log('[task-session-manager] tool.execute.after task', {
     callID: input.callID,
     sessionID: input.sessionID,
@@ -341,10 +379,9 @@ export async function handleToolExecuteAfter(
     if (typeof output.output !== 'string') return;
     if (pending.earlyRegistrationRejected) {
       log(
-        '[task-session-manager] ignored task output after fenced early registration',
+        '[task-session-manager] task output previously fenced; re-evaluating registration against board state',
         { callID: pending.callId },
       );
-      return;
     }
 
     const launch = parseTaskLaunchOutput(output.output);
@@ -516,7 +553,23 @@ function registerTaskOutputLaunch(
     );
     return undefined;
   }
-  if (pending.earlyRegisteredTaskID && !existing) return undefined;
+  if (
+    pending.earlyRegisteredTaskID &&
+    pending.earlyRegisteredTaskID !== taskID &&
+    !existing
+  ) {
+    // The pending was cross-marked by another child's session.created
+    // (parallel same-agent launches). The taskID parsed from THIS call's
+    // own output is authoritative — register it instead of dropping.
+    log(
+      '[task-session-manager] registering authoritative task ID despite cross-marked pending',
+      {
+        taskID,
+        crossMarkedTaskID: pending.earlyRegisteredTaskID,
+        callID: pending.callId,
+      },
+    );
+  }
 
   try {
     return deps.backgroundJobBoard.registerLaunch({
