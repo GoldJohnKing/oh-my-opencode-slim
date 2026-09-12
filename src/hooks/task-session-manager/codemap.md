@@ -63,7 +63,7 @@ All modules depend on `BackgroundJobBoard` from `src/utils/background-job-board.
     - The idle timer remains a backstop for when the model ends its turn without further requests; after reconciling injected terminal results, the opt-in continuation evaluator can run in the same idle cycle under its existing guards
 
 5. **Lifecycle Events (`event`)**
-    - `session.created`: Adds new task IDs to pending managed set
+    - `session.created`: Adds new task IDs to pending managed set. Early board registration claims a pending call only when it can be identified unambiguously: a unique child-session `title` match (the v2 host stamps `title = description` argument) or a unique agent-type match among unmarked pendings. Ambiguous or unattributable children get a placeholder `unattributed <agent> task` registration so task_status always resolves them; the owning `tool.execute.after` corrects the description. An already-registered child never fences a pending, and a pending's flags never cause `tool.execute.after` to drop the task ID parsed from its own output.
     - `session.idle` / `session.status` (idle): Reconciles injected terminal jobs for the parent session (backstop path), then can run the opt-in continuation evaluator in the same idle cycle under its existing guards. Child idle is a stop candidate: the first observation stays provisional, and only a confirmed idle/absent after the 5s grace marks `stopped`
     - `session.status` (busy): Marks sessions as running from live session state and resets pending stop confirmation
     - `session.deleted`: Clears job state, child jobs, and pending call records for the session
