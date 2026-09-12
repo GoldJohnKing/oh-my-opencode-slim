@@ -41,6 +41,16 @@ export interface PendingCallTracker {
     ownerBoard?: BackgroundJobStore,
     options?: { recordConsumed?: boolean },
   ): PendingTaskCall | undefined;
+  /** Remove and return the pending call whose early registration claimed
+   * `taskID` for this parent — an identity-verified take for hosts that
+   * do not supply tool call IDs. When `ownerBoard` is given and the
+   * early registration was adopted by a different board generation, the
+   * pending is left for that generation (same fence as `take`). */
+  takeByTaskID(
+    parentSessionId: string,
+    taskID: string,
+    ownerBoard?: BackgroundJobStore,
+  ): PendingTaskCall | undefined;
   release(call: PendingTaskCall): void;
   peekByParent(parentSessionId: string): PendingTaskCall | undefined;
   peekByParentAndAgent(
@@ -103,6 +113,18 @@ export function createPendingCallTracker(
     return false;
   };
 
+  const solePendingIdForParent = (
+    parentSessionId: string,
+  ): string | undefined => {
+    let found: string | undefined;
+    for (const [callId, call] of pendingCalls.entries()) {
+      if (call.parentSessionId !== parentSessionId) continue;
+      if (found !== undefined) return undefined;
+      found = callId;
+    }
+    return found;
+  };
+
   const releaseCallLease = (call: PendingTaskCall): void => {
     if (call.relaunchLease) {
       (call.releaseLease ?? options.releaseLease)?.(call.relaunchLease);
@@ -132,13 +154,15 @@ export function createPendingCallTracker(
       takeOptions?: { recordConsumed?: boolean },
     ) {
       if (!callId && parentSessionId) {
-        for (const id of pendingCalls.keys()) {
-          const call = pendingCalls.get(id);
-          if (call && call.parentSessionId === parentSessionId) {
-            callId = id;
-            break;
-          }
-        }
+        // Without a tool call ID a take can only be sound when exactly
+        // one pending exists for the parent (after-hooks fire once per
+        // call, so a sole survivor belongs to this call). With several
+        // candidates, guessing by insertion order would mis-attribute
+        // the label and could overwrite an already-correct record —
+        // refuse and let the caller resolve identity via takeByTaskID.
+        const sole = solePendingIdForParent(parentSessionId);
+        if (!sole) return undefined;
+        callId = sole;
       }
       if (!callId) return undefined;
       const pending = pendingCalls.get(callId);
@@ -235,6 +259,32 @@ export function createPendingCallTracker(
 
     hasConsumedCall(parentSessionId: string, agentType?: string): boolean {
       return hasConsumedFor(parentSessionId, agentType);
+    },
+
+    takeByTaskID(
+      parentSessionId: string,
+      taskID: string,
+      ownerBoard?: BackgroundJobStore,
+    ) {
+      for (const [callId, call] of pendingCalls.entries()) {
+        if (
+          call.parentSessionId !== parentSessionId ||
+          call.earlyRegisteredTaskID !== taskID
+        ) {
+          continue;
+        }
+        if (
+          call.earlyRegistration &&
+          ownerBoard &&
+          call.earlyRegistration.backgroundJobBoard !== ownerBoard
+        ) {
+          return undefined;
+        }
+        pendingCalls.delete(callId);
+        recordConsumed(call);
+        return call;
+      }
+      return undefined;
     },
 
     adoptEarlyRegistrations(

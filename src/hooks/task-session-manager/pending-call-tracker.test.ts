@@ -130,3 +130,46 @@ describe('peekByParentAndAgent', () => {
     expect(hit?.callId).toBe('b');
   });
 });
+
+describe('take', () => {
+  test('without callID, refuses when multiple pendings match the parent', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    expect(tracker.take(undefined, 'parent-1')).toBeUndefined();
+    // Nothing was consumed by the refused take.
+    expect(tracker.hasConsumedCall('parent-1')).toBe(false);
+  });
+
+  test('without callID, takes the sole pending for the parent', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+
+    const taken = tracker.take(undefined, 'parent-1');
+
+    expect(taken?.callId).toBe('a');
+  });
+});
+
+describe('takeByTaskID', () => {
+  test('removes and returns the pending claimed for that task ID', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', earlyRegisteredTaskID: 'ses_x' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    const taken = tracker.takeByTaskID('parent-1', 'ses_x');
+
+    expect(taken?.callId).toBe('a');
+    // The other pending is untouched.
+    expect(tracker.take('b')?.callId).toBe('b');
+  });
+
+  test('returns undefined when no pending is claimed for the task ID', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', earlyRegisteredTaskID: 'ses_x' }));
+
+    expect(tracker.takeByTaskID('parent-1', 'ses_y')).toBeUndefined();
+    expect(tracker.take('a')?.callId).toBe('a');
+  });
+});

@@ -196,4 +196,67 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
     // the stale child keeps the honest placeholder label, never B's
     expect(board.get(sX)?.description).toBe('unattributed oracle task');
   });
+
+  test('no-callID hosts: swapped after-hooks cannot corrupt descriptions', async () => {
+    const board = new BackgroundJobBoard();
+    const hook = createHook(board);
+    const sA = 'ses_aaaa1111';
+    const sB = 'ses_bbbb2222';
+    const v1Launch = (taskID: string) =>
+      [
+        `task_id: ${taskID}`,
+        'state: running',
+        '',
+        '<task_result>',
+        'Background task started.',
+        '</task_result>',
+      ].join('\n');
+
+    // two parallel calls WITHOUT callIDs (v1 legacy hosts): the before
+    // hook assigns anonymous pending IDs in insertion order
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: PARENT },
+      {
+        args: {
+          subagent_type: 'oracle',
+          description: L_A,
+          prompt: 'do the review',
+          background: true,
+        },
+      },
+    );
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: PARENT },
+      {
+        args: {
+          subagent_type: 'oracle',
+          description: L_B,
+          prompt: 'do the review',
+          background: true,
+        },
+      },
+    );
+
+    // created-first: titles claim the right pendings
+    await hook.event(created({ child: sA, title: L_A }));
+    await hook.event(created({ child: sB, title: L_B }));
+    expect(board.get(sA)?.description).toBe(L_A);
+    expect(board.get(sB)?.description).toBe(L_B);
+
+    // after-hooks fire in SWAPPED order with no callIDs: the oldest
+    // pending is A's, but this output belongs to call B — the oldest
+    // guess must neither drop sB nor overwrite its correct label
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: v1Launch(sB) },
+    );
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: v1Launch(sA) },
+    );
+
+    expect(board.taskIDs()).toEqual(new Set([sA, sB]));
+    expect(board.get(sA)?.description).toBe(L_A);
+    expect(board.get(sB)?.description).toBe(L_B);
+  });
 });

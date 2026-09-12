@@ -288,6 +288,11 @@ export async function handleToolExecuteAfter(
         ownerBoard?: BackgroundJobStore,
         options?: { recordConsumed?: boolean },
       ): PendingTaskCall | undefined;
+      takeByTaskID(
+        sessionID: string,
+        taskID: string,
+        ownerBoard?: BackgroundJobStore,
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };
     taskContextTracker: {
@@ -330,13 +335,33 @@ export async function handleToolExecuteAfter(
     typeof input.callID === 'string' && input.callID.trim() !== ''
       ? input.callID
       : undefined;
-  const pending = deps.pendingCallTracker.take(
+  let pending = deps.pendingCallTracker.take(
     exactCallID,
     exactCallID ? undefined : input.sessionID,
     deps.backgroundJobBoard,
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
+  if (!pending && typeof output.output === 'string') {
+    // No tool call ID (or unknown one): resolve identity via the task
+    // ID parsed from this call's own output, matched against the
+    // pending the early registration claimed for that child. This
+    // avoids guessing by insertion order among parallel calls.
+    const identityTaskID = parseTaskIdFromTaskOutput(output.output);
+    if (identityTaskID && input.sessionID) {
+      pending = deps.pendingCallTracker.takeByTaskID(
+        input.sessionID,
+        identityTaskID,
+        deps.backgroundJobBoard,
+      );
+      if (pending) {
+        log(
+          '[task-session-manager] resolved task output identity via early-registered task ID',
+          { taskID: identityTaskID, callID: pending.callId },
+        );
+      }
+    }
+  }
   log('[task-session-manager] tool.execute.after task', {
     callID: input.callID,
     sessionID: input.sessionID,
