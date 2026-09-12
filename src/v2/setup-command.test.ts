@@ -989,6 +989,51 @@ describe('tool execute bridge normalization', () => {
     );
     expect(nextTurn).not.toContain(LOOP_GUARD_WARNING);
   });
+
+  test('per-request chat.message emulation keys on the trailing user message', async () => {
+    const chatCalls: Array<Record<string, unknown>> = [];
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      chatMessage: async (input) => {
+        chatCalls.push(input as Record<string, unknown>);
+      },
+    });
+    const base = { sessionID: 'ses_cmd', agent: 'orchestrator' };
+
+    // user-last: the trailing user message id is forwarded.
+    await handler(
+      makeEvent([
+        { id: 'a1', role: 'assistant', content: [] },
+        { id: 'u1', role: 'user', content: [] },
+      ]),
+    );
+    expect(chatCalls.at(-1)).toEqual({ ...base, messageID: 'u1' });
+
+    // user-not-last: the LAST user message wins, not the first —
+    // and a trailing NON-user message must be skipped by the
+    // backward scan (a `messages.at(-1)`-only regression would fail).
+    await handler(
+      makeEvent([
+        { id: 'u2', role: 'user', content: [] },
+        { id: 'a2', role: 'assistant', content: [] },
+        { id: 'u3', role: 'user', content: [] },
+        { id: 'a3', role: 'assistant', content: [] },
+      ]),
+    );
+    expect(chatCalls.at(-1)).toEqual({ ...base, messageID: 'u3' });
+
+    // no-user: no messageID.
+    await handler(makeEvent([{ id: 'a3', role: 'assistant', content: [] }]));
+    expect(chatCalls.at(-1)).toEqual(base);
+
+    // empty message list: no messageID.
+    await handler(makeEvent([]));
+    expect(chatCalls.at(-1)).toEqual(base);
+
+    // trailing user message with an empty-string id: no messageID.
+    await handler(makeEvent([{ id: '', role: 'user', content: [] }]));
+    expect(chatCalls.at(-1)).toEqual(base);
+  });
 });
 
 describe('tool execute bridge status discrimination', () => {
@@ -1234,6 +1279,40 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
       providerID: 'anthropic',
       modelID: 'claude-fallback',
     });
+  });
+
+  test('observeContext omits messageID when the trailing user id is empty or absent', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = createSessionPromptBridge(async (input) => {
+      calls.push(input as Record<string, unknown>);
+    });
+    // Trailing user message with an empty-string id: the newly-learned
+    // forward carries state but no messageID.
+    await bridge.observeContext(
+      makeEvent([{ id: '', role: 'user', content: [] }], {
+        sessionID: 'ses_p',
+        agent: 'orchestrator',
+      }),
+    );
+    expect(calls).toEqual([{ sessionID: 'ses_p', agent: 'orchestrator' }]);
+
+    // No user message at all: same omission (the model change forces a
+    // new forward, so the shape is observable).
+    await bridge.observeContext(
+      makeEvent([{ id: 'a1', role: 'assistant', content: [] }], {
+        sessionID: 'ses_p',
+        agent: 'orchestrator',
+        model: { id: 'claude-x', providerID: 'anthropic' },
+      }),
+    );
+    expect(calls).toEqual([
+      { sessionID: 'ses_p', agent: 'orchestrator' },
+      {
+        sessionID: 'ses_p',
+        agent: 'orchestrator',
+        model: { providerID: 'anthropic', modelID: 'claude-x' },
+      },
+    ]);
   });
 
   test('agent learned from context is carried by the next admission', async () => {
