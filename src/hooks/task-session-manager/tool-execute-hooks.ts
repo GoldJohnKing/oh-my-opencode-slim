@@ -341,10 +341,9 @@ export async function handleToolExecuteAfter(
     if (typeof output.output !== 'string') return;
     if (pending.earlyRegistrationRejected) {
       log(
-        '[task-session-manager] ignored task output after fenced early registration',
+        '[task-session-manager] task output previously fenced; re-evaluating registration against board state',
         { callID: pending.callId },
       );
-      return;
     }
 
     const launch = parseTaskLaunchOutput(output.output);
@@ -516,7 +515,23 @@ function registerTaskOutputLaunch(
     );
     return undefined;
   }
-  if (pending.earlyRegisteredTaskID && !existing) return undefined;
+  if (
+    pending.earlyRegisteredTaskID &&
+    pending.earlyRegisteredTaskID !== taskID &&
+    !existing
+  ) {
+    // The pending was cross-marked by another child's session.created
+    // (parallel same-agent launches). The taskID parsed from THIS call's
+    // own output is authoritative — register it instead of dropping.
+    log(
+      '[task-session-manager] registering authoritative task ID despite cross-marked pending',
+      {
+        taskID,
+        crossMarkedTaskID: pending.earlyRegisteredTaskID,
+        callID: pending.callId,
+      },
+    );
+  }
 
   try {
     return deps.backgroundJobBoard.registerLaunch({
