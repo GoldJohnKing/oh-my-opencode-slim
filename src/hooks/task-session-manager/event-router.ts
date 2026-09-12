@@ -336,12 +336,17 @@ export async function handleEvent(
       const pending = deps.pendingCallTracker.peekByParentAndAgent(
         info.parentID,
         info.agent,
+        typeof info.title === 'string' ? info.title : undefined,
       );
       if (pending && !pending.resumedTaskId && !pending.earlyRegisteredTaskID) {
         if (deps.backgroundJobBoard.get(info.id)) {
-          pending.earlyRegistrationRejected = true;
+          // The child is already registered — its own tool.execute.after
+          // won the race. Fencing the peeked pending here punished an
+          // unrelated call and caused its later output to be dropped
+          // (incident 2026-09-12); the existing board record already
+          // prevents double registration.
           log(
-            '[task-session-manager] refused early registration for an existing task ID',
+            '[task-session-manager] skipped early registration for an already-registered task ID',
             { taskID: info.id, parentSessionID: info.parentID },
           );
         } else {
@@ -385,6 +390,45 @@ export async function handleEvent(
               },
             );
           }
+        }
+      }
+
+      if (!pending && !deps.backgroundJobBoard.get(info.id)) {
+        // No pending call can be attributed to this child (ambiguous
+        // parallel launches, or the owning pending was consumed).
+        // Register a placeholder so task_status/task_result always
+        // resolve it; the matching tool.execute.after corrects the
+        // description via registerLaunch's existing-record update path
+        // when it fires.
+        const agent =
+          typeof info.agent === 'string' && info.agent ? info.agent : 'unknown';
+        try {
+          const record = deps.backgroundJobBoard.registerLaunch({
+            taskID: info.id,
+            parentSessionID: info.parentID,
+            agent,
+            description: `unattributed ${agent} task`,
+            objective: `unattributed ${agent} task`,
+            background: false,
+          });
+          log(
+            '[task-session-manager] placeholder board registration for unattributed child session',
+            {
+              taskID: record.taskID,
+              alias: record.alias,
+              parentSessionID: info.parentID,
+              agent,
+            },
+          );
+        } catch (error) {
+          log(
+            '[task-session-manager] refused placeholder registration for child session',
+            {
+              taskID: info.id,
+              parentSessionID: info.parentID,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
         }
       }
     }
