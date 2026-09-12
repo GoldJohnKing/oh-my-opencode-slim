@@ -170,6 +170,37 @@ describe('take', () => {
     const hit = tracker.peekByParentAndAgent('parent-1', 'oracle');
     expect(hit?.callId).toBe('b');
   });
+
+  test('fenced sole-survivor take does not stain the unconsumed pending', () => {
+    const tracker = createPendingCallTracker();
+    const ownerBoard = new BackgroundJobBoard();
+    const otherBoard = new BackgroundJobBoard();
+    tracker.add(
+      pending({
+        callId: 'a',
+        earlyRegisteredTaskID: 'ses_x',
+        earlyRegistration: {
+          taskID: 'ses_x',
+          generation: 1,
+          backgroundJobBoard: ownerBoard,
+        },
+      }),
+    );
+    tracker.add(pending({ callId: 'b' }));
+    // Arm the parent's unresolved window via a drain (the flagged
+    // early-registered pending is skipped; 'b' is consumed).
+    tracker.takeUnresolvedFirstMatch('parent-1', { identityTaskID: 'ses_y' });
+
+    // The sole survivor is fenced for another board generation: the
+    // no-callId take refuses WITHOUT consuming — the armed window must
+    // not stain the still-tracked pending.
+    expect(tracker.take(undefined, 'parent-1', otherBoard)).toBeUndefined();
+
+    // The owning generation resolves it by claim, unflagged.
+    const claimed = tracker.takeByTaskID('parent-1', 'ses_x', ownerBoard);
+    expect(claimed?.callId).toBe('a');
+    expect(claimed?.identityUnresolved).toBeUndefined();
+  });
 });
 
 describe('takeByTaskID', () => {
@@ -370,5 +401,48 @@ describe('takeUnresolvedFirstMatch', () => {
     tracker.add(pending({ callId: 'b', parentSessionId: 'parent-1' }));
     const sole = tracker.take(undefined, 'parent-1');
     expect(sole?.identityUnresolved).toBeUndefined();
+  });
+});
+
+describe('adoptEarlyRegistrations', () => {
+  test('identity-unresolved pendings adopt with generic metadata', () => {
+    const oldBoard = new BackgroundJobBoard();
+    const newBoard = new BackgroundJobBoard();
+    const tracker = createPendingCallTracker();
+    tracker.add(
+      pending({
+        callId: 'flagged',
+        label: 'Flagged label',
+        identityUnresolved: true,
+        earlyRegisteredTaskID: 'ses_flagged',
+        earlyRegistration: {
+          taskID: 'ses_flagged',
+          generation: 1,
+          backgroundJobBoard: oldBoard,
+        },
+      }),
+    );
+    tracker.add(
+      pending({
+        callId: 'clean',
+        label: 'Clean label',
+        earlyRegisteredTaskID: 'ses_clean',
+        earlyRegistration: {
+          taskID: 'ses_clean',
+          generation: 1,
+          backgroundJobBoard: oldBoard,
+        },
+      }),
+    );
+
+    tracker.adoptEarlyRegistrations(newBoard);
+
+    // A flagged pending never paints its label: the adopted record
+    // falls back to the board's generic default description.
+    expect(newBoard.get('ses_flagged')?.description).toBe(
+      'background oracle task',
+    );
+    // A resolved pending keeps its verified label.
+    expect(newBoard.get('ses_clean')?.description).toBe('Clean label');
   });
 });

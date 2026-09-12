@@ -398,9 +398,10 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
         },
       ] as const;
 
-    // Burst of three no-ID, no-title calls; the pending cap evicts the
-    // oldest pending (its ticket was released at eviction —
-    // pre-existing behavior) before any after-hook fires.
+    // Burst of three no-ID, no-title calls. The direct tracker.take
+    // simulates the oldest pending disappearing without its after-hook
+    // (e.g. a real pending-cap eviction would also release its ticket;
+    // immaterial here since no concurrency limiter is injected).
     await hook['tool.execute.before'](...noIDBefore(L_A));
     await hook['tool.execute.before'](...noIDBefore(L_B));
     await hook['tool.execute.before'](...noIDBefore(L_C));
