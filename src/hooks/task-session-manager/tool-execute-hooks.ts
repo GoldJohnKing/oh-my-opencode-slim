@@ -35,34 +35,8 @@ interface TaskArgs {
   background?: unknown;
 }
 
-const earlyRegistrationGenerations = new WeakMap<PendingTaskCall, number>();
 function normalizeObjectiveKey(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-/**
- * session.created writes earlyRegisteredTaskID through the pending-call
- * object. Capture the generation at that boundary so a delayed native result
- * cannot reuse the current record after a same-ID relaunch.
- */
-function installEarlyRegistrationGenerationFence(
-  pending: PendingTaskCall,
-  backgroundJobBoard: BackgroundJobStore,
-): void {
-  let earlyRegisteredTaskID = pending.earlyRegisteredTaskID;
-  Object.defineProperty(pending, 'earlyRegisteredTaskID', {
-    configurable: true,
-    enumerable: true,
-    get: () => earlyRegisteredTaskID,
-    set: (taskID: string | undefined) => {
-      earlyRegisteredTaskID = taskID;
-      if (!taskID) return;
-      const generation = backgroundJobBoard.get(taskID)?.generation;
-      if (generation !== undefined) {
-        earlyRegistrationGenerations.set(pending, generation);
-      }
-    },
-  });
 }
 
 export async function handleToolExecuteBefore(
@@ -147,7 +121,6 @@ export async function handleToolExecuteBefore(
       typeof args.description === 'string' ? args.description : undefined,
     prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
   });
-  installEarlyRegistrationGenerationFence(pendingCall, deps.backgroundJobBoard);
   if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
     const requested = args.task_id.trim();
     const remembered =
@@ -565,9 +538,7 @@ function registerTaskOutputLaunch(
   if (resumed && pending.resumedTaskId !== taskID) return undefined;
 
   const existing = deps.backgroundJobBoard.get(taskID);
-  const earlyRegistrationGeneration =
-    pending.earlyRegistration?.generation ??
-    earlyRegistrationGenerations.get(pending);
+  const earlyRegistrationGeneration = pending.earlyRegistration?.generation;
   if (
     pending.earlyRegisteredTaskID === taskID &&
     earlyRegistrationGeneration !== undefined &&

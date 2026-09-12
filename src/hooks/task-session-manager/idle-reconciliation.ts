@@ -348,11 +348,8 @@ export function createIdleReconciler(options: {
       errorTerminalizeTimers.set(sessionID, timer);
     };
 
-    if (options.isFallbackInProgress?.(sessionID)) {
-      // Fallback in flight when we first schedule — start watching anyway.
-      schedule();
-      return;
-    }
+    // Schedule even when a fallback is already in flight: the timer
+    // callback reschedules until the fallback outcome is known.
     schedule();
   }
 

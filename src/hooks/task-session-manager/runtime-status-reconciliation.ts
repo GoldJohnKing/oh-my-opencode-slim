@@ -63,9 +63,7 @@ export function createRuntimeStatusReconciler(options: {
       return;
     }
     if (timer) return;
-    if (
-      !options.backgroundJobBoard.list().some((job) => job.state === 'running')
-    ) {
+    if (!options.backgroundJobBoard.hasRunningJobs()) {
       return;
     }
     timer = setTimeout(() => {

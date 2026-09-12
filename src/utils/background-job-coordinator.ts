@@ -346,6 +346,10 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return this.board.list(parentSessionID);
   }
 
+  hasRunningJobs(): boolean {
+    return this.board.hasRunningJobs();
+  }
+
   hasRunning(parentSessionID: string): boolean {
     return this.board.hasRunning(parentSessionID);
   }

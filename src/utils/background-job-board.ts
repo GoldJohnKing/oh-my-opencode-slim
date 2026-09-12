@@ -1013,6 +1013,13 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     return filtered.sort((a, b) => a.launchedAt - b.launchedAt);
   }
 
+  hasRunningJobs(): boolean {
+    for (const job of this.jobs.values()) {
+      if (job.state === 'running') return true;
+    }
+    return false;
+  }
+
   hasRunning(parentSessionID: string): boolean {
     return this.list(parentSessionID).some((job) => job.state === 'running');
   }
