@@ -1094,12 +1094,9 @@ export function createOrchestratorWakeScheduler(
 
       // Reserve before promptAsync so a failed call cannot storm retries and
       // concurrent hook instances cannot double-wake.
-      if (applyArchiveState(sessionID, state, latest.archiveState)) return;
       if (!commitWakeReservation(sessionID, owner, latestFingerprint)) {
         return;
       }
-
-      if (!capabilities.ready) return;
 
       const wakeText = recoveryWake
         ? ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT
@@ -1232,18 +1229,16 @@ export function createOrchestratorWakeScheduler(
     ) {
       return;
     }
+    pendingStoppedRecoveries.add(sessionID);
     if (localSessions.get(sessionID)?.archived) {
-      pendingStoppedRecoveries.add(sessionID);
       return;
     }
-    pendingStoppedRecoveries.add(sessionID);
     rearmWakeProgress(sessionID);
     if (!canSchedule(sessionID)) return;
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);
     state.continuousIdle = true;
-    rearmWakeProgress(sessionID);
     void evaluate(sessionID, state.generation, true);
   }
 
@@ -1355,18 +1350,16 @@ export function createOrchestratorWakeScheduler(
       return;
     }
 
-    if (type === 'session.error' || type === 'session.status') {
-      if (
-        type === 'session.error' ||
-        (type === 'session.status' &&
-          properties?.status?.type !== 'idle' &&
-          properties?.status?.type !== 'busy')
-      ) {
-        if (options.shouldManageSession(sessionID)) {
-          // Errors / retry are external lifecycle — rearm.
-          clearExpectingWakeBusy(sessionID);
-          endIdleSpell(sessionID, true);
-        }
+    if (
+      type === 'session.error' ||
+      (type === 'session.status' &&
+        properties?.status?.type !== 'idle' &&
+        properties?.status?.type !== 'busy')
+    ) {
+      if (options.shouldManageSession(sessionID)) {
+        // Errors / retry are external lifecycle — rearm.
+        clearExpectingWakeBusy(sessionID);
+        endIdleSpell(sessionID, true);
       }
     }
   }
@@ -1397,7 +1390,3 @@ export function createOrchestratorWakeScheduler(
     },
   };
 }
-
-export type OrchestratorWakeScheduler = ReturnType<
-  typeof createOrchestratorWakeScheduler
->;
