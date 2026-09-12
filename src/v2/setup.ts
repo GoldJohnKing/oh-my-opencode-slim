@@ -270,9 +270,7 @@ export function createSessionContextHandler(
     // only when the native prompt hook did NOT take over).
     if (deps.chatMessage) {
       try {
-        const userMessage = [...event.messages]
-          .reverse()
-          .find((message) => message.role === 'user');
+        const userMessage = trailingUserMessage(event.messages);
         await deps.chatMessage(
           {
             sessionID: event.sessionID,
@@ -412,6 +410,26 @@ export interface V2SessionPromptBridge {
   agentForSession(sessionID: string): string | undefined;
 }
 
+/** Trailing (last) message with `role === 'user'`, or undefined. Hot
+ * path — runs per LLM request on v2 hosts — so it scans backward in
+ * place instead of allocating a reversed copy. */
+function trailingUserMessage(
+  messages: V2SessionContextEvent['messages'],
+): V2SessionContextEvent['messages'][number] | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === 'user') return message;
+  }
+  return undefined;
+}
+
+/** Non-empty id of the trailing user message (see `trailingUserMessage`),
+ * or undefined when there is none. */
+function trailingUserId(event: V2SessionContextEvent): string | undefined {
+  const id = trailingUserMessage(event.messages)?.id;
+  return typeof id === 'string' && id ? id : undefined;
+}
+
 /**
  * Native `session.prompt` hook → v1 `chat.message` bridge.
  *
@@ -462,13 +480,6 @@ export function createSessionPromptBridge(
   /** First admitted prompt per session, deferred until the agent is
    * learned from a context event (bounded: one per session). */
   const pendingPrompts = new Map<string, V1ChatMessageInput>();
-
-  function trailingUserId(event: V2SessionContextEvent): string | undefined {
-    const id = [...event.messages]
-      .reverse()
-      .find((message) => message.role === 'user')?.id;
-    return typeof id === 'string' && id ? id : undefined;
-  }
 
   async function deliver(
     label: string,
@@ -575,6 +586,7 @@ export function createSessionPromptBridge(
         });
         pruneSessionMap(sessionState);
       }
+      const trailingId = trailingUserId(event);
       const pending = pendingPrompts.get(sessionID);
       if (pending) {
         if (agent && previous?.agent !== agent) {
@@ -592,10 +604,7 @@ export function createSessionPromptBridge(
           });
           return;
         }
-        if (
-          trailingUserId(event) &&
-          trailingUserId(event) !== pending.messageID
-        ) {
+        if (trailingId && trailingId !== pending.messageID) {
           // The conversation moved past the pending admission without the
           // agent ever being learned (e.g. a synthetic/compaction request
           // followed): flush best-known so the delivery is not lost.
@@ -608,7 +617,7 @@ export function createSessionPromptBridge(
         sessionID,
         ...(agent ? { agent } : {}),
         ...(model ? { model } : {}),
-        ...(trailingUserId(event) ? { messageID: trailingUserId(event) } : {}),
+        ...(trailingId ? { messageID: trailingId } : {}),
       });
     },
 
