@@ -61,11 +61,11 @@ entrypoint v2 loads when the `dist/server` directory is registered directly
 (see [Installing on v2](#installing-on-v2)); the release artifact check
 requires it. v1 uses the main entry.
 
-Verified against opencode2 `beta-19365` (all bridges green — health check
-`bridges:11`; live mock-driven re-verification on 2026-09-09 exercised the
-event-stream bridge end-to-end, including the orchestrator-wake
-children-driven degraded mode firing a queued wake after 60 s of parent
-idle with a stalled background child). Every v2 API the adapter touches is
+Verified live on OpenCode v2 (all bridges green — health check
+`bridges:11`; the event stream, bridges, and orchestrator-wake
+children-driven degraded mode are exercised end-to-end on the stable host,
+including a queued wake firing after 60 s of parent idle with a stalled
+background child). Every v2 API the adapter touches is
 capability-probed at runtime (`typeof ctx.mcp?.transform === 'function'`,
 `s.switchModel`, `ctx.generate`, …), so a host lacking one capability
 degrades that single feature with a log line instead of breaking the load.
@@ -151,9 +151,8 @@ degrades that single feature with a log line instead of breaking the load.
     - `event` → `ctx.event.subscribe()` loop feeding `mapV2EventToV1`
       (`src/v2/event-adapter.ts`): additive synthesis only — the raw v2 event
       is always dispatched first (the interview bridge depends on it), then
-      synthesized v1 shapes: idle `session.status` → `session.idle`, flat
-      child `session.created` → v1 early-registration
-      `{info: {id, parentID, agent?}}`, usage telemetry
+      synthesized v1 shapes: flat child `session.created` → v1
+      early-registration `{info: {id, parentID, agent?}}`, usage telemetry
       (`session.usage.updated`/`session.step.ended`) → a deduplicated
       completed-assistant `message.updated` for the cache monitor, the Form
       flow (`form.created`/`form.replied`/`form.cancelled`) → v1
@@ -162,19 +161,19 @@ degrades that single feature with a log line instead of breaking the load.
       sentinel are skipped), and `permission.asked` field mapping to the v1
       names (`permission` ← `action`, `patterns` ← `resources`;
       `permission.replied` passes through raw — v2's shape already matches
-      the v1 event). Newer hosts (verified live on beta-19365/beta-19378)
-      publish durable `session.execution.started/succeeded/failed/
-      interrupted` and no longer stream busy/idle `session.status` on the
-      event flow; those events are synthesized into the same v1 lifecycle
-      shapes (`started` → busy `session.status`; terminal subtypes → idle
-      `session.status` + `session.idle`; `failed` additionally emits a v1
-      `session.error` with the host error payload before the idle pair).
-      The `session.status` → `session.idle` path is retained for older
-      builds — hosts emitting both simply deliver idle repeatedly, which
-      the double-idle invariant tolerates. This is what keeps the
-      companion's waiting-input indicator, the task-session-manager
-      input-wait gate, orchestrator-wake suppression/arm scheduling, and
-      the foreground fallback working on v2 hosts.
+      the v1 event). V2 hosts publish durable `session.execution.started/
+      succeeded/failed/interrupted` and emit no busy/idle `session.status`
+      and no `session.idle` on the event stream — the observed payloads
+      always ride under `data` (verified live, 80-event capture). The
+      adapter synthesizes the v1 lifecycle shapes from those execution
+      events (`started` → busy `session.status`; terminal subtypes → idle
+      `session.status` + `session.idle`; `failed` → a v1 `session.error`
+      with the host error payload before the idle pair), and no
+      `session.status`-based fallback remains. The execution-event
+      synthesis keeps orchestrator-wake suppression/arm scheduling and the
+      foreground fallback working on v2 hosts, while the Form and
+      permission bridges above feed the companion's waiting-input
+      indicator and the task-session-manager input-wait gate.
    - `generate.text` → one-shot generation channel probed on `ctx.generate`
      and threaded as `experimental_v2.generateText`, powering the webfetch
      secondary-model summaries without a temp session
@@ -212,28 +211,25 @@ currently break this plugin:
 
 - **Event payloads ride under `data`, not `properties`.** The v2
   event stream (SSE and `ctx.event.subscribe()`) frames each event as
-  `{id, created, type, location?, durable?, data}` — the payload is the
-  `data` record, unlike the v1 SDK's `properties` (verified live on
-  beta-19365: every observed event keyed exactly
-  `["id","created","type","durable","data"]`). The adapter reads `data`
-  first with `properties` as a legacy fallback and always writes
-  `properties` on the synthesized v1 shapes, because that is the key the
-  v1 consumers read.
-- **Lifecycle keys on `session.execution.*` on newer hosts.** Verified
-  live hosts (beta-19365/beta-19378) publish durable
+  `{id, created, type, location?, durable?, metadata?, data}` — the payload
+  is the `data` record, unlike the v1 SDK's `properties` (verified live:
+  every observed event keyed `["id","created","type","durable","data"]`,
+  with the optional `metadata?` key observed on some events).
+  The adapter reads `data` first with `properties` as a legacy fallback and
+  always writes `properties` on the synthesized v1 shapes, because that is
+  the key the v1 consumers read.
+- **Lifecycle keys on `session.execution.*`.** V2 hosts publish durable
   `session.execution.started/succeeded/failed/interrupted` events
   (`{sessionID}`, plus `error` on `.failed` and `reason` on
-  `.interrupted`) and no longer publish busy/idle `session.status` on
-  the SSE event stream (`session.status` remains only in the schema).
-  The adapter synthesizes the v1 lifecycle shapes from the execution
-  events (`started` → busy `session.status`; terminal subtypes → idle
-  `session.status` + `session.idle`; `failed` → a v1 `session.error`
+  `.interrupted`) and emit no busy/idle `session.status` and no
+  `session.idle` on the event stream (`session.status` remains only in the
+  schema). The adapter synthesizes the v1 lifecycle shapes from the
+  execution events (`started` → busy `session.status`; terminal subtypes →
+  idle `session.status` + `session.idle`; `failed` → a v1 `session.error`
   with the host error payload passed through best-effort, emitted before
   the idle pair so the error-then-idle flow the event-router expects is
-  preserved). The `session.status` mapping is retained for older builds;
-  a host emitting both delivers idle repeatedly — the double-idle
-  invariant above covers it. Without this synthesis the
-  orchestrator-wake scheduler never arms on live v2 hosts.
+  preserved). Without this synthesis the orchestrator-wake scheduler never
+  arms on live v2 hosts.
 - **Transcript user messages carry no identity.** Context-hook
   transcript user messages on live v2 hosts carry `{id, time, text,
   type}` only — no `agent`, no `sessionID`. The v1 injection gates
@@ -256,11 +252,12 @@ currently break this plugin:
   v1 hosts expose the method and keep the exact historical polling
   behavior. Background job stop-confirmation was never obtainable from
   the v2 poll anyway (the lookup failed every time).
-- **Duplicate idle delivery.** v2 favors `session.status` over
-  `session.idle`; the adapter synthesizes `session.idle` additively, so a
-  consumer watching both events sees idle twice per session. Current
-  consumers are idempotent per session (idle-reconciliation's per-session
-  timer guards); new idle consumers must tolerate duplicate delivery.
+- **Duplicate idle delivery.** The adapter synthesizes both an idle
+  `session.status` and a `session.idle` from each terminal execution event,
+  so a consumer watching both sees idle twice per terminal transition.
+  Current consumers are idempotent per session (idle-reconciliation's
+  per-session timer guards); new idle consumers must tolerate duplicate
+  delivery.
 - **Duplicate `permission.asked` delivery.** The adapter appends a
   v1-field-mapped copy after the raw v2 `permission.asked` event (raw
   first is a load-bearing invariant for v2-native handlers). Consumers

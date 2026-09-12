@@ -451,11 +451,11 @@ describe('createV2Setup e2e', () => {
     events.push(v2UsageEvent('ses_cache', { input: 500, read: 9000 }));
     events.push(v2UsageEvent('ses_cache', { input: 12000, read: 0 }));
 
-    // Idle session.status → synthesized session.idle reaches the v1
-    // event-router (which logs the observation for any session id).
+    // Terminal execution.succeeded → synthesized idle pair reaches the
+    // v1 event-router (which logs the observation for any session id).
     events.push({
-      type: 'session.status',
-      properties: { sessionID: 'ses_cache', status: { type: 'idle' } },
+      type: 'session.execution.succeeded',
+      properties: { sessionID: 'ses_cache' },
     });
 
     await settlePump();
@@ -481,8 +481,8 @@ describe('createV2Setup e2e', () => {
     );
     events.push(v2UsageEvent('ses_after', { input: 12000, read: 0 }));
     events.push({
-      type: 'session.status',
-      properties: { sessionID: 'ses_after', status: { type: 'idle' } },
+      type: 'session.execution.succeeded',
+      properties: { sessionID: 'ses_after' },
     });
     await settlePump();
 
