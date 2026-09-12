@@ -1,11 +1,7 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { isInternalInitiatorPart } from '../../utils';
 import { SessionLifecycle } from '../session-lifecycle';
-import {
-  ForegroundFallbackManager,
-  isFailoverError,
-  isRetryableError,
-} from './index';
+import { ForegroundFallbackManager, isFailoverError } from './index';
 
 // ACCEPTANCE GAP: config() hook behaviour is not covered by CI — verify live.
 
@@ -108,22 +104,22 @@ describe('isFailoverError', () => {
   });
 
   test('returns true for 429 status code', () => {
-    expect(isRetryableError({ data: { statusCode: 429 } })).toBe(true);
+    expect(isFailoverError({ data: { statusCode: 429 } })).toBe(true);
   });
 
   test('returns true for "rate limit" in message', () => {
-    expect(isRetryableError({ message: 'Rate limit exceeded' })).toBe(true);
+    expect(isFailoverError({ message: 'Rate limit exceeded' })).toBe(true);
   });
 
   test('returns true for "quota exceeded" in responseBody', () => {
-    expect(isRetryableError({ data: { responseBody: 'quota exceeded' } })).toBe(
+    expect(isFailoverError({ data: { responseBody: 'quota exceeded' } })).toBe(
       true,
     );
   });
 
   test('returns true for bailian "quota has been exhausted" (issue #1083)', () => {
     expect(
-      isRetryableError({
+      isFailoverError({
         message:
           'Your token-plan 1-week quota has been exhausted. The quota will reset at 08-27 15:33:00 UTC.',
       }),
@@ -198,24 +194,24 @@ describe('isFailoverError', () => {
   });
 
   test('returns true for "usage exceeded"', () => {
-    expect(isRetryableError({ message: 'usage exceeded' })).toBe(true);
+    expect(isFailoverError({ message: 'usage exceeded' })).toBe(true);
   });
 
   test('returns true for "overloaded"', () => {
-    expect(isRetryableError({ message: 'overloaded_error' })).toBe(true);
+    expect(isFailoverError({ message: 'overloaded_error' })).toBe(true);
   });
 
   test('returns true for "Insufficient balance."', () => {
-    expect(isRetryableError({ message: 'Insufficient balance.' })).toBe(true);
+    expect(isFailoverError({ message: 'Insufficient balance.' })).toBe(true);
   });
 
   test('returns true for "Service Unavailable"', () => {
-    expect(isRetryableError({ message: 'Service Unavailable' })).toBe(true);
+    expect(isFailoverError({ message: 'Service Unavailable' })).toBe(true);
   });
 
   test('returns true for "Monthly usage limit reached"', () => {
     expect(
-      isRetryableError({
+      isFailoverError({
         message: 'Monthly usage limit reached. Resets in X days.',
       }),
     ).toBe(true);
@@ -223,7 +219,7 @@ describe('isFailoverError', () => {
 
   test('returns true for "5-hour usage limit reached"', () => {
     expect(
-      isRetryableError({
+      isFailoverError({
         message: '5-hour usage limit reached. Resets in 36min.',
       }),
     ).toBe(true);
@@ -231,90 +227,90 @@ describe('isFailoverError', () => {
 
   test('returns true for "Weekly usage limit reached"', () => {
     expect(
-      isRetryableError({
+      isFailoverError({
         message: 'Weekly usage limit reached. Resets in 2 days.',
       }),
     ).toBe(true);
   });
 
   test('returns false for non-rate-limit error', () => {
-    expect(isRetryableError({ message: 'invalid API key' })).toBe(false);
+    expect(isFailoverError({ message: 'invalid API key' })).toBe(false);
   });
 
   test('returns false for null', () => {
-    expect(isRetryableError(null)).toBe(false);
+    expect(isFailoverError(null)).toBe(false);
   });
 
   test('returns true for string error with rate-limit message', () => {
-    expect(isRetryableError('Usage exceeded')).toBe(true);
-    expect(isRetryableError('rate limit exceeded')).toBe(true);
-    expect(isRetryableError('quota exceeded')).toBe(true);
+    expect(isFailoverError('Usage exceeded')).toBe(true);
+    expect(isFailoverError('rate limit exceeded')).toBe(true);
+    expect(isFailoverError('quota exceeded')).toBe(true);
   });
 
   test('returns false for non-object', () => {
-    expect(isRetryableError(42)).toBe(false);
+    expect(isFailoverError(42)).toBe(false);
   });
 
   test('returns true for 403 status code', () => {
-    expect(isRetryableError({ data: { statusCode: 403 } })).toBe(true);
+    expect(isFailoverError({ data: { statusCode: 403 } })).toBe(true);
   });
 
   test('returns true for 401 status code', () => {
-    expect(isRetryableError({ statusCode: 401 })).toBe(true);
-    expect(isRetryableError({ data: { statusCode: 401 } })).toBe(true);
+    expect(isFailoverError({ statusCode: 401 })).toBe(true);
+    expect(isFailoverError({ data: { statusCode: 401 } })).toBe(true);
   });
 
   test('returns true for 410 Gone (model end-of-life)', () => {
-    expect(isRetryableError({ statusCode: 410 })).toBe(true);
-    expect(isRetryableError({ data: { statusCode: 410 } })).toBe(true);
+    expect(isFailoverError({ statusCode: 410 })).toBe(true);
+    expect(isFailoverError({ data: { statusCode: 410 } })).toBe(true);
     expect(
-      isRetryableError({
+      isFailoverError({
         message:
           "The model 'mistralai/mistral-small-4-119b-2603' has reached its end of life on 2026-07-27T00:00:00Z and is no longer available.",
       }),
     ).toBe(true);
     // The AI SDK surfaces HTTP 410 as the bare title "Gone" in the message.
-    expect(isRetryableError({ message: 'AI_APICallError: Gone' })).toBe(true);
-    expect(isRetryableError('Gone')).toBe(true);
+    expect(isFailoverError({ message: 'AI_APICallError: Gone' })).toBe(true);
+    expect(isFailoverError('Gone')).toBe(true);
   });
 
   test('returns true for 401 upstream provider error message', () => {
     expect(
-      isRetryableError(
+      isFailoverError(
         'AI_APICallError: Upstream request failed: [401] Provider returned error',
       ),
     ).toBe(true);
     expect(
-      isRetryableError({
+      isFailoverError({
         message:
           'AI_APICallError: Upstream request failed: [401] Provider returned error',
       }),
     ).toBe(true);
     expect(
-      isRetryableError({ data: { message: 'Upstream request failed [401]' } }),
+      isFailoverError({ data: { message: 'Upstream request failed [401]' } }),
     ).toBe(true);
   });
 
   test('returns true for "Forbidden" in message', () => {
-    expect(isRetryableError({ message: '403 Forbidden' })).toBe(true);
+    expect(isFailoverError({ message: '403 Forbidden' })).toBe(true);
   });
 
   test('returns true for "blocked by gateway" in message', () => {
-    expect(isRetryableError({ message: 'blocked by gateway' })).toBe(true);
+    expect(isFailoverError({ message: 'blocked by gateway' })).toBe(true);
   });
 
   test('returns true for "forbidden" (lowercase) in message', () => {
-    expect(isRetryableError({ message: 'forbidden' })).toBe(true);
+    expect(isFailoverError({ message: 'forbidden' })).toBe(true);
   });
 
   test('returns true for NewAPI "no available channel" error shapes', () => {
     const message =
       'No available channel for model gpt-5.6-luna under group Codex专用 (distributor) (request id: abc123)';
 
-    expect(isRetryableError(message)).toBe(true);
-    expect(isRetryableError({ message })).toBe(true);
+    expect(isFailoverError(message)).toBe(true);
+    expect(isFailoverError({ message })).toBe(true);
     expect(
-      isRetryableError({
+      isFailoverError({
         data: { statusCode: 400, responseBody: message },
       }),
     ).toBe(true);
@@ -324,15 +320,15 @@ describe('isFailoverError', () => {
     const message =
       'auth_unavailable: no auth available (providers=cli-proxy-api, model=gemini-3.6-flash)';
 
-    expect(isRetryableError(message)).toBe(true);
-    expect(isRetryableError({ message })).toBe(true);
+    expect(isFailoverError(message)).toBe(true);
+    expect(isFailoverError({ message })).toBe(true);
     expect(
-      isRetryableError({
+      isFailoverError({
         data: { statusCode: 400, responseBody: message },
       }),
     ).toBe(true);
     expect(
-      isRetryableError({
+      isFailoverError({
         data: {
           responseBody:
             '{"error":{"message":"auth_unavailable: no auth available","type":"server_error","code":"internal_server_error"}}',
@@ -342,20 +338,20 @@ describe('isFailoverError', () => {
   });
 
   test('returns true for "cannot connect to API" transport errors', () => {
-    expect(isRetryableError('Cannot connect to API')).toBe(true);
-    expect(isRetryableError('stream error: Cannot connect to API')).toBe(true);
+    expect(isFailoverError('Cannot connect to API')).toBe(true);
+    expect(isFailoverError('stream error: Cannot connect to API')).toBe(true);
     expect(
-      isRetryableError({ message: 'stream error: Cannot connect to API' }),
+      isFailoverError({ message: 'stream error: Cannot connect to API' }),
     ).toBe(true);
   });
 
   test('returns false for non-API connection errors', () => {
-    expect(isRetryableError('Cannot connect to database')).toBe(false);
+    expect(isFailoverError('Cannot connect to database')).toBe(false);
   });
 
   test('returns false for permanent channel-not-found errors', () => {
     expect(
-      isRetryableError({
+      isFailoverError({
         message: 'channel not found for model gpt-5.6-luna',
       }),
     ).toBe(false);

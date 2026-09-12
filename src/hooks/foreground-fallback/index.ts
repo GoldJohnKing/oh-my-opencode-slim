@@ -215,14 +215,6 @@ export function isFailoverError(error: unknown): boolean {
   return hasFailoverReason;
 }
 
-/**
- * Checks whether an error is a transient/retryable error (rate-limit,
- * 403/Forbidden, etc.) that should trigger model fallback.
- */
-export function isRetryableError(error: unknown): boolean {
-  return isFailoverError(error);
-}
-
 const INLINE_STATUS_CODES = new Set([401, 410]);
 
 /**

@@ -43,7 +43,7 @@ export interface SyntheticPartCacheHint {
   ttlSeconds?: number;
 }
 
-export interface TaggedSyntheticPartSpec {
+interface TaggedSyntheticPartSpec {
   /** Text content of the injected part. */
   text: string;
   /**
