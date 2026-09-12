@@ -221,6 +221,8 @@ export interface BackgroundJobStore {
   ): BackgroundJobRecord | undefined;
   taskIDs(): Set<string>;
   list(parentSessionID?: string): BackgroundJobRecord[];
+  /** Cheap global check for any running job: single pass, no copy or sort. */
+  hasRunningJobs(): boolean;
   hasRunning(parentSessionID: string): boolean;
   hasTerminalUnreconciled(parentSessionID: string): boolean;
   hasConvergenceSignals(taskID: string, threshold?: number): boolean;

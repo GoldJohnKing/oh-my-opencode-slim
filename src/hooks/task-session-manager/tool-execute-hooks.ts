@@ -35,34 +35,8 @@ interface TaskArgs {
   background?: unknown;
 }
 
-const earlyRegistrationGenerations = new WeakMap<PendingTaskCall, number>();
 function normalizeObjectiveKey(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-/**
- * session.created writes earlyRegisteredTaskID through the pending-call
- * object. Capture the generation at that boundary so a delayed native result
- * cannot reuse the current record after a same-ID relaunch.
- */
-function installEarlyRegistrationGenerationFence(
-  pending: PendingTaskCall,
-  backgroundJobBoard: BackgroundJobStore,
-): void {
-  let earlyRegisteredTaskID = pending.earlyRegisteredTaskID;
-  Object.defineProperty(pending, 'earlyRegisteredTaskID', {
-    configurable: true,
-    enumerable: true,
-    get: () => earlyRegisteredTaskID,
-    set: (taskID: string | undefined) => {
-      earlyRegisteredTaskID = taskID;
-      if (!taskID) return;
-      const generation = backgroundJobBoard.get(taskID)?.generation;
-      if (generation !== undefined) {
-        earlyRegistrationGenerations.set(pending, generation);
-      }
-    },
-  });
 }
 
 export async function handleToolExecuteBefore(
@@ -147,7 +121,6 @@ export async function handleToolExecuteBefore(
       typeof args.description === 'string' ? args.description : undefined,
     prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
   });
-  installEarlyRegistrationGenerationFence(pendingCall, deps.backgroundJobBoard);
   if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
     const requested = args.task_id.trim();
     const remembered =
@@ -293,6 +266,14 @@ export async function handleToolExecuteAfter(
         taskID: string,
         ownerBoard?: BackgroundJobStore,
       ): PendingTaskCall | undefined;
+      takeUnresolvedFirstMatch(
+        sessionID: string,
+        selection?: {
+          identityTaskID?: string;
+          agentType?: string;
+          ownerBoard?: BackgroundJobStore;
+        },
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };
     taskContextTracker: {
@@ -342,12 +323,13 @@ export async function handleToolExecuteAfter(
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
+  let identityTaskID: string | undefined;
   if (!pending && typeof output.output === 'string') {
     // No tool call ID (or unknown one): resolve identity via the task
     // ID parsed from this call's own output, matched against the
     // pending the early registration claimed for that child. This
     // avoids guessing by insertion order among parallel calls.
-    const identityTaskID = parseTaskIdFromTaskOutput(output.output);
+    identityTaskID = parseTaskIdFromTaskOutput(output.output);
     if (identityTaskID && input.sessionID) {
       pending = deps.pendingCallTracker.takeByTaskID(
         input.sessionID,
@@ -360,6 +342,39 @@ export async function handleToolExecuteAfter(
           { taskID: identityTaskID, callID: pending.callId },
         );
       }
+    }
+  }
+  if (!pending && !exactCallID && identityTaskID && input.sessionID) {
+    // Both identity sources missed: a parallel no-callID burst where
+    // no early registration claimed the parsed task ID. Returning
+    // here would strand a pending — its concurrency ticket never
+    // releases, and sole-survivor takes refuse forever while it
+    // remains (parent poisoning). The task ID parsed from this call's
+    // own output is authoritative, so drain the oldest eligible
+    // pending through the guarded first-match fallback and let the
+    // normal try/finally path release the ticket and process output.
+    const childRecord = deps.backgroundJobBoard.get(identityTaskID);
+    const childAgent =
+      childRecord && childRecord.parentSessionID === input.sessionID
+        ? childRecord.agent
+        : undefined;
+    pending = deps.pendingCallTracker.takeUnresolvedFirstMatch(
+      input.sessionID,
+      {
+        identityTaskID,
+        agentType: childAgent,
+        ownerBoard: deps.backgroundJobBoard,
+      },
+    );
+    if (pending) {
+      log(
+        '[task-session-manager] unresolvable no-ID take; consuming first-match pending (drain fallback)',
+        {
+          taskID: identityTaskID,
+          callID: pending.callId,
+          consumedAgent: pending.agentType,
+        },
+      );
     }
   }
   log('[task-session-manager] tool.execute.after task', {
@@ -523,9 +538,7 @@ function registerTaskOutputLaunch(
   if (resumed && pending.resumedTaskId !== taskID) return undefined;
 
   const existing = deps.backgroundJobBoard.get(taskID);
-  const earlyRegistrationGeneration =
-    pending.earlyRegistration?.generation ??
-    earlyRegistrationGenerations.get(pending);
+  const earlyRegistrationGeneration = pending.earlyRegistration?.generation;
   if (
     pending.earlyRegisteredTaskID === taskID &&
     earlyRegistrationGeneration !== undefined &&
@@ -571,13 +584,29 @@ function registerTaskOutputLaunch(
     );
   }
 
+  if (pending.identityUnresolved) {
+    log(
+      '[task-session-manager] registered authoritative task ID with generic metadata (identity unresolved)',
+      { taskID, callID: pending.callId },
+    );
+  }
+
   try {
     return deps.backgroundJobBoard.registerLaunch({
       taskID,
       parentSessionID: pending.parentSessionId,
       agent: pending.agentType,
-      description: pending.label,
-      objective: pending.fullObjective ?? pending.label,
+      // Identity was unresolved (no-ID drain or window-shifted take):
+      // the label/objective may belong to a sibling call, so never
+      // paint them. Existing placeholder records keep their honest
+      // description; fresh records fall back to registerLaunch's
+      // generic default.
+      ...(pending.identityUnresolved
+        ? {}
+        : {
+            description: pending.label,
+            objective: pending.fullObjective ?? pending.label,
+          }),
       background: exactCallConfirmed && pending.background,
       preserveRun:
         pending.earlyRegisteredTaskID === taskID ||

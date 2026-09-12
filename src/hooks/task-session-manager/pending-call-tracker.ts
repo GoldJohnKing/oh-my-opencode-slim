@@ -29,6 +29,10 @@ export interface PendingTaskCall {
   earlyRegisteredTaskID?: string;
   earlyRegistration?: EarlyTaskRegistration;
   earlyRegistrationRejected?: boolean;
+  /** Consumed without verified call identity (no-ID drain fallback or a
+   *  window-shifted sole take): the label/objective may belong to a
+   *  sibling call and must not be painted onto the board record. */
+  identityUnresolved?: boolean;
 }
 
 const MAX_PENDING_TASK_CALLS = 100;
@@ -50,6 +54,29 @@ export interface PendingCallTracker {
     parentSessionId: string,
     taskID: string,
     ownerBoard?: BackgroundJobStore,
+  ): PendingTaskCall | undefined;
+  /** Guarded drain fallback for no-tool-call-ID hosts: when neither a
+   *  call ID nor an early-registration claim could identify the
+   *  pending, remove and return the OLDEST unmarked pending for the
+   *  parent — constrained to `agentType` when the child's agent is
+   *  known, and never a resumed pending pinned to a different
+   *  `identityTaskID` (that pending provably belongs to another call).
+   *  Pendings claimed by an early registration or fenced for another
+   *  board generation are left for their owners. Consumption is
+   *  recorded exactly like `take()`. The consumed call is marked
+   *  `identityUnresolved` and arms the parent's unresolved window, so
+   *  later no-callID sole-survivor takes for the same parent are
+   *  flagged too. Returns undefined when no eligible pending exists. */
+  takeUnresolvedFirstMatch(
+    parentSessionId: string,
+    selection?: {
+      /** Task ID parsed from the consuming call's own output. */
+      identityTaskID?: string;
+      /** Agent of the child session that produced that output. */
+      agentType?: string;
+      /** Board-generation fence, same as take()/takeByTaskID(). */
+      ownerBoard?: BackgroundJobStore;
+    },
   ): PendingTaskCall | undefined;
   release(call: PendingTaskCall): void;
   peekByParent(parentSessionId: string): PendingTaskCall | undefined;
@@ -77,6 +104,12 @@ export function createPendingCallTracker(
 ) {
   const pendingCalls = new Map<string, PendingTaskCall>();
   let anonymousPendingCallId = 0;
+
+  /** Parents where a pending was consumed through the unresolved-identity
+   *  drain fallback. The sole-survivor argument for a later no-callID
+   *  take only holds while every prior take was resolved; one unresolved
+   *  drain shifts the window, so subsequent sole takes are flagged too. */
+  const unresolvedDrainParents = new Set<string>();
 
   /** Calls already consumed by their tool.execute.after, kept briefly so
    * late no-title session.created events can be recognized as possibly
@@ -155,14 +188,26 @@ export function createPendingCallTracker(
     ) {
       if (!callId && parentSessionId) {
         // Without a tool call ID a take can only be sound when exactly
-        // one pending exists for the parent (after-hooks fire once per
-        // call, so a sole survivor belongs to this call). With several
-        // candidates, guessing by insertion order would mis-attribute
-        // the label and could overwrite an already-correct record —
-        // refuse and let the caller resolve identity via takeByTaskID.
+        // one pending exists for the parent. "A sole survivor belongs
+        // to this call" is a sequential argument — it holds when the
+        // parent's other after-hooks already consumed their pendings,
+        // not during a parallel burst where several after-hooks race.
+        // With several candidates, guessing by insertion order would
+        // mis-attribute the label and could overwrite an
+        // already-correct record, so the take refuses; the caller
+        // resolves identity via takeByTaskID (early-registration
+        // claim) or, failing that, drains one pending through the
+        // guarded takeUnresolvedFirstMatch fallback.
         const sole = solePendingIdForParent(parentSessionId);
         if (!sole) return undefined;
         callId = sole;
+        // Window-shift propagation: an unresolved drain earlier in this
+        // parent's burst means "sole survivor belongs to this call" no
+        // longer proves identity — flag the taken pending unresolved.
+        if (unresolvedDrainParents.has(parentSessionId)) {
+          const solePending = pendingCalls.get(sole);
+          if (solePending) solePending.identityUnresolved = true;
+        }
       }
       if (!callId) return undefined;
       const pending = pendingCalls.get(callId);
@@ -287,6 +332,56 @@ export function createPendingCallTracker(
       return undefined;
     },
 
+    takeUnresolvedFirstMatch(
+      parentSessionId: string,
+      selection?: {
+        identityTaskID?: string;
+        agentType?: string;
+        ownerBoard?: BackgroundJobStore;
+      },
+    ) {
+      for (const [callId, call] of pendingCalls.entries()) {
+        if (call.parentSessionId !== parentSessionId) continue;
+        // Only unmarked pendings are eligible: an early-registration
+        // claim (or its rejection fence) ties the pending to another
+        // resolution path that must keep working.
+        if (call.earlyRegisteredTaskID || call.earlyRegistrationRejected) {
+          continue;
+        }
+        // A resumed pending pinned to a different task ID belongs to a
+        // call whose own output carries that ID.
+        if (
+          selection?.identityTaskID !== undefined &&
+          call.resumedTaskId !== undefined &&
+          call.resumedTaskId !== selection.identityTaskID
+        ) {
+          continue;
+        }
+        if (
+          selection?.agentType !== undefined &&
+          call.agentType !== selection.agentType
+        ) {
+          continue;
+        }
+        if (
+          call.earlyRegistration &&
+          selection?.ownerBoard &&
+          call.earlyRegistration.backgroundJobBoard !== selection.ownerBoard
+        ) {
+          continue;
+        }
+        pendingCalls.delete(callId);
+        recordConsumed(call);
+        // Identity was not verified: the consumed pending's metadata may
+        // belong to a sibling call, and the parent's sole-survivor
+        // window has shifted for any later no-callID take.
+        call.identityUnresolved = true;
+        unresolvedDrainParents.add(parentSessionId);
+        return call;
+      }
+      return undefined;
+    },
+
     adoptEarlyRegistrations(
       backgroundJobBoard: BackgroundJobStore,
       backgroundJobSupervisor?: BackgroundJobSupervisor,
@@ -346,6 +441,7 @@ export function createPendingCallTracker(
           consumedCalls.delete(callId);
         }
       }
+      unresolvedDrainParents.delete(sessionId);
       // Release queued tickets before active tickets. Releasing an active
       // ticket pumps the scheduler, so doing it in insertion order could
       // admit a later call just as the parent is being deleted.
@@ -358,6 +454,7 @@ export function createPendingCallTracker(
       const removed = [...pendingCalls.values()].reverse();
       pendingCalls.clear();
       consumedCalls.clear();
+      unresolvedDrainParents.clear();
       for (const pending of removed) releaseCallLease(pending);
     },
 

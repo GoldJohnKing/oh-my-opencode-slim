@@ -17,6 +17,33 @@ import {
 import { extractChildTerminalEvidence } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { getClient } from '../../utils/opencode-client';
+import type { SessionLifecycle } from '../session-lifecycle';
+import { isMessageWithParts, isUserMessageWithParts } from '../types';
+import {
+  BACKGROUND_JOB_BOARD_METADATA_KEY,
+  type InjectedTerminalJobs,
+  type InjectionState,
+  injectBackgroundJobBoard,
+  observeSyntheticTerminalPart,
+  reconcileInjectedTerminalJobs,
+  stabilizeRunningTaskParts,
+  updateFromInjectedCompletion,
+} from './board-injection';
+import { handleEvent } from './event-router';
+import { createIdleReconciler } from './idle-reconciliation';
+import { createIdleSessionTokens } from './idle-session-tokens';
+import { createInputWaitTracker } from './input-wait-tracker';
+import {
+  createPendingCallTracker,
+  type PendingCallTracker,
+} from './pending-call-tracker';
+import type { RevivedRunTracker } from './revived-run-tracker';
+import { createRuntimeStatusReconciler } from './runtime-status-reconciliation';
+import { createTaskContextTracker } from './task-context-tracker';
+import {
+  handleToolExecuteAfter,
+  handleToolExecuteBefore,
+} from './tool-execute-hooks';
 
 /** Extract the final assistant text from a child session transcript
  * (v1-shaped {data:[{info,parts}]} via the client shim's messages). Used
@@ -50,34 +77,6 @@ async function readFinalAssistantText(
     return undefined;
   }
 }
-
-import type { SessionLifecycle } from '../session-lifecycle';
-import { isMessageWithParts, isUserMessageWithParts } from '../types';
-import {
-  BACKGROUND_JOB_BOARD_METADATA_KEY,
-  type InjectedTerminalJobs,
-  type InjectionState,
-  injectBackgroundJobBoard,
-  observeSyntheticTerminalPart,
-  reconcileInjectedTerminalJobs,
-  stabilizeRunningTaskParts,
-  updateFromInjectedCompletion,
-} from './board-injection';
-import { handleEvent } from './event-router';
-import { createIdleReconciler } from './idle-reconciliation';
-import { createIdleSessionTokens } from './idle-session-tokens';
-import { createInputWaitTracker } from './input-wait-tracker';
-import {
-  createPendingCallTracker,
-  type PendingCallTracker,
-} from './pending-call-tracker';
-import type { RevivedRunTracker } from './revived-run-tracker';
-import { createRuntimeStatusReconciler } from './runtime-status-reconciliation';
-import { createTaskContextTracker } from './task-context-tracker';
-import {
-  handleToolExecuteAfter,
-  handleToolExecuteBefore,
-} from './tool-execute-hooks';
 
 export { BACKGROUND_JOB_BOARD_METADATA_KEY } from './board-injection';
 

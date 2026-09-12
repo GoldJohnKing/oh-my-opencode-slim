@@ -23,6 +23,23 @@ describe('BackgroundJobBoard', () => {
       terminalUnreconciled: false,
     });
     expect(board.hasRunning('parent-1')).toBe(true);
+    expect(board.hasRunningJobs()).toBe(true);
+  });
+  test('hasRunningJobs is false once no job is running', () => {
+    const board = new BackgroundJobBoard();
+    expect(board.hasRunningJobs()).toBe(false);
+    board.registerLaunch({
+      taskID: 'ses_idle',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map config',
+    });
+    board.updateStatus({
+      taskID: 'ses_idle',
+      state: 'completed',
+      resultSummary: 'done',
+    });
+    expect(board.hasRunningJobs()).toBe(false);
   });
   test('markUsed lands strictly after completion even with equal timestamps', () => {
     const board = new BackgroundJobBoard();
