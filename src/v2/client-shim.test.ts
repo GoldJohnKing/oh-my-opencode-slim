@@ -723,6 +723,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
             a: Record<string, unknown> & {
               delivery?: 'steer' | 'queue';
               modelSwitch?: 'required';
+              modelVariant?: string;
             },
           ) => Promise<unknown>;
         };
@@ -838,6 +839,79 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
     expect(prompts).toHaveLength(1);
     expect(prompts[0]?.delivery).toBe('queue');
     expect((res as { switched: boolean }).switched).toBe(false);
+  });
+
+  test('promptAsync merges modelVariant into the switchModel model ref', async () => {
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const promptAsync = makePromptAsync({
+      switchModel: async (i: unknown) => {
+        seq.push({ m: 'switchModel', i });
+      },
+      prompt: async (i: unknown) => {
+        seq.push({ m: 'prompt', i });
+        return {};
+      },
+    } as never);
+    await promptAsync({
+      path: { id: 'ses_1' },
+      body: {
+        agent: 'orchestrator',
+        model: { providerID: 'test', modelID: 'model-a' },
+        parts: [{ type: 'text', text: 'wake reminder' }],
+      },
+      delivery: 'queue',
+      modelVariant: 'max',
+    });
+    expect(seq).toHaveLength(2);
+    const switchCall = seq[0] as { i: { model: unknown } };
+    expect(switchCall.i.model).toEqual({
+      id: 'model-a',
+      providerID: 'test',
+      variant: 'max',
+    });
+  });
+
+  test('promptAsync without modelVariant keeps the switchModel ref variant-free', async () => {
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const promptAsync = makePromptAsync({
+      switchModel: async (i: unknown) => {
+        seq.push({ m: 'switchModel', i });
+      },
+      prompt: async (i: unknown) => {
+        seq.push({ m: 'prompt', i });
+        return {};
+      },
+    } as never);
+    await promptAsync({
+      path: { id: 'ses_1' },
+      body: {
+        model: { providerID: 'test', modelID: 'model-a' },
+        parts: [{ type: 'text', text: 'retry me' }],
+      },
+    });
+    const switchCall = seq[0] as { i: { model: Record<string, unknown> } };
+    const model = switchCall.i.model;
+    expect(model).toEqual({ id: 'model-a', providerID: 'test' });
+    expect(Object.hasOwn(model, 'variant')).toBe(false);
+  });
+
+  test('promptAsync modelVariant without a body model does not switch models', async () => {
+    const seq: Array<{ m: string; i: unknown }> = [];
+    const promptAsync = makePromptAsync({
+      switchModel: async (i: unknown) => {
+        seq.push({ m: 'switchModel', i });
+      },
+      prompt: async (i: unknown) => {
+        seq.push({ m: 'prompt', i });
+        return {};
+      },
+    } as never);
+    await promptAsync({
+      path: { id: 'ses_1' },
+      body: { parts: [{ type: 'text', text: 'plain steer' }] },
+      modelVariant: 'max',
+    });
+    expect(seq.map((e) => e.m)).toEqual(['prompt']);
   });
 });
 

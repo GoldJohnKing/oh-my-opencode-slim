@@ -327,6 +327,7 @@ export function buildPluginInput(
         args: Record<string, unknown> & {
           delivery?: 'steer' | 'queue';
           modelSwitch?: 'required';
+          modelVariant?: string;
         },
       ) => {
         const delivery = args?.delivery === 'queue' ? 'queue' : 'steer';
@@ -361,18 +362,29 @@ export function buildPluginInput(
         const ref = modelRefFromBody(body);
         let switched = false;
         if (ref) {
+          // `modelVariant` is the v2-only channel for the wake model's
+          // reasoning-effort variant (v1 prompt bodies carry no variant
+          // slot). A non-empty string overrides the ref's variant so
+          // switchModel does not reset it to the host default.
+          const switchRef =
+            typeof args?.modelVariant === 'string' && args.modelVariant
+              ? { ...ref, variant: args.modelVariant }
+              : ref;
           if (s.switchModel) {
             // The prompt delivery is the load-bearing action: a failed
             // model switch degrades to steering on the CURRENT model
             // (logged here; `switched: false` on the result) instead of
             // aborting the caller's fallback chain (upstream #1125).
             try {
-              await s.switchModel({ sessionID: sessionIDOf(args), model: ref });
+              await s.switchModel({
+                sessionID: sessionIDOf(args),
+                model: switchRef,
+              });
               switched = true;
             } catch (err) {
               log('[v2][shim] session.switchModel failed', {
                 id: sessionIDOf(args),
-                model: ref,
+                model: switchRef,
                 error: err instanceof Error ? err.message : String(err),
               });
             }

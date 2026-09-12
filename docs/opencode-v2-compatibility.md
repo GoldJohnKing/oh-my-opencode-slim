@@ -379,10 +379,16 @@ How it differs from the v1 path:
   historical probe set (`get`/`todo`/`children`/`status`/`promptAsync`).
 - **Children enumeration:** `session.list({ parentID })` through the shim
   (v2 `Session.Info` → v1 envelope; `outcome` and `time.updated` mapped).
-  When the listing is unavailable (missing/erroring/empty), an event-tracked
-  fallback uses the adapter-synthesized `session.created` parentID links plus
-  tracked busy/idle statuses. Results are scoped to the session's directory
-  when the host reports one.
+  The in-process session surface of current v2 hosts does not expose
+  `list`, so the empty page falls back to an event-tracked view — the
+  adapter-synthesized `session.created` parentID links plus tracked
+  busy/idle statuses — refreshed on every evaluation with the host's
+  authoritative `outcome`/`time.updated` via `session.get` (fail-soft per
+  child). A finished child is therefore terminal immediately instead of
+  reading active for the whole staleness window, and a live child stays
+  visible on its host evidence rather than dropping out on stale local
+  evidence. Results are scoped to the session's directory when the host
+  reports one.
 - **Wake condition:** children with `outcome === undefined` (v2 records an
   outcome only on terminal transition: succeeded|failed|interrupted) that
   still have fresh update evidence — host `time.updated` or a tracked status
@@ -392,6 +398,9 @@ How it differs from the v1 path:
 - **Wake delivery:** `delivery: "queue"` — v1 `prompt_async` queued, and a
   v2 `steer` would hijack an in-flight run. The shim's `promptAsync` keeps
   `steer` as the default so the foreground-fallback replay is unchanged.
+  The wake model pin carries the session model's variant as the v2-only
+  `modelVariant` argument, so `switchModel` preserves the reasoning-effort
+  setting instead of resetting it to the host default.
 - **Fingerprint:** children-only (id + outcome + tracked status + update
   evidence); the two-wake no-progress cap still bounds cost.
 

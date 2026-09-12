@@ -878,6 +878,54 @@ export function createOrchestratorWakeScheduler(
             return evidenceAt === undefined ? { id } : { id, evidenceAt };
           })
         : [];
+
+      // Event-tracked children carry no `outcome` and their local evidence
+      // can go stale while the child is still running. The host is
+      // authoritative on every evaluation, so refresh EVERY fallback child
+      // via session.get: a live child never drops out of the watchdog on
+      // stale local evidence, and a discovered terminal outcome stays in the
+      // snapshot so the wake fingerprint does not flip between terminal and
+      // unknown (which would spuriously rearm the no-progress cap). Fail-soft
+      // per child; extra calls are bounded by the tracked-children set and
+      // the evaluation cadence.
+      const getSession = sessionSdk.get;
+      if (
+        capabilities.flavor === 'v2' &&
+        typeof getSession === 'function' &&
+        children.length > 0
+      ) {
+        children = await Promise.all(
+          children.map(async (child) => {
+            try {
+              const response = (await getSession({
+                path: { id: child.id },
+                query: { directory },
+                throwOnError: true,
+              })) as { data?: unknown };
+              const session = isObjectRecord(response?.data)
+                ? response.data
+                : undefined;
+              if (!session) return child;
+              const outcome =
+                typeof session.outcome === 'string' && session.outcome
+                  ? session.outcome
+                  : undefined;
+              const evidence = childUpdateEvidenceMs(session);
+              const enriched: WakeChildInfo = { ...child };
+              if (outcome) enriched.outcome = outcome;
+              if (
+                evidence !== undefined &&
+                (child.evidenceAt === undefined || evidence > child.evidenceAt)
+              ) {
+                enriched.evidenceAt = evidence;
+              }
+              return enriched;
+            } catch {
+              return child;
+            }
+          }),
+        );
+      }
     }
 
     // Workspace scoping: drop children the host reports under another
@@ -1110,7 +1158,10 @@ export function createOrchestratorWakeScheduler(
       };
       if (wakeMode === 'children' && capabilities.flavor === 'v2') {
         // v1 prompt_async queued; 'queue' preserves that on v2 ('steer'
-        // would hijack an in-flight run).
+        // would hijack an in-flight run). The v1 prompt body has no variant
+        // slot, so the wake model's reasoning-effort variant travels as the
+        // v2-only `modelVariant`; the shim merges it into the switchModel
+        // ref. Absent variant leaves the call shape unchanged.
         await (
           sessionSdk.promptAsync as (
             args: Record<string, unknown>,
@@ -1120,6 +1171,9 @@ export function createOrchestratorWakeScheduler(
           query: { directory },
           body,
           delivery: 'queue',
+          ...(modelSelection?.variant
+            ? { modelVariant: modelSelection.variant }
+            : {}),
           throwOnError: true,
         });
       } else {

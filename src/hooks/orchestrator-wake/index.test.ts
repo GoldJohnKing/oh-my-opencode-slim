@@ -1286,6 +1286,53 @@ describe('children-driven degraded mode (v2)', () => {
     );
   });
 
+  test('v2 children wake carries the session model variant as modelVariant', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [{ id: 'c1', time: { updated: Date.now() } }],
+        get: mock(async () => ({
+          data: {
+            model: { providerID: 'test', id: 'model-a', variant: 'max' },
+          },
+        })),
+      }),
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
+    )[0]?.[0] as { modelVariant?: string };
+    expect(call.modelVariant).toBe('max');
+  });
+
+  test('v2 children wake omits modelVariant when the model has none', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [{ id: 'c1', time: { updated: Date.now() } }],
+        get: mock(async () => ({ data: {} })),
+      }),
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
+    )[0]?.[0] as { modelVariant?: string; body: { model?: unknown } };
+    expect(call.body.model).toBeUndefined();
+    expect(call.modelVariant).toBeUndefined();
+  });
+
   test('does not wake an archived v2 session', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -1742,6 +1789,161 @@ describe('children enumeration fallback (v2)', () => {
     expect(promptAsync).not.toHaveBeenCalled();
     expect(scheduler._test.childEvidence.has('c1')).toBe(false);
   });
+
+  test('terminal outcome from session.get suppresses the fallback wake', async () => {
+    const promptAsync = mock(async () => ({}));
+    const get = mock(async () => ({
+      data: { outcome: 'succeeded', time: { updated: Date.now() } },
+    }));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [], get }),
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.created',
+        properties: { info: { id: 'c1', parentID: 'p1' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(clock.pendingCount()).toBe(0);
+  });
+
+  test('fallback child without an outcome still wakes on fresh evidence', async () => {
+    const promptAsync = mock(async () => ({}));
+    const get = mock(async () => ({
+      data: { time: { updated: Date.now() } },
+    }));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [], get }),
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.created',
+        properties: { info: { id: 'c1', parentID: 'p1' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('session.get failure keeps the evidence-based fallback verdict', async () => {
+    const promptAsync = mock(async () => ({}));
+    const get = mock(async () => {
+      throw new Error('get unavailable');
+    });
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [], get }),
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.created',
+        properties: { info: { id: 'c1', parentID: 'p1' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('session.get unavailable leaves the event-tracked fallback unchanged', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [] }),
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.created',
+        properties: { info: { id: 'c1', parentID: 'p1' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('host evidence keeps a child active despite stale local evidence', async () => {
+    const promptAsync = mock(async () => ({}));
+    const get = mock(async () => ({
+      data: { time: { updated: Date.now() } },
+    }));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [], get }),
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.created',
+        properties: { info: { id: 'c1', parentID: 'p1' } },
+      },
+    });
+    // The event-tracked evidence goes stale, but the child is still running
+    // and the host reports fresh time.updated — it must not drop out of the
+    // watchdog on stale local evidence alone.
+    scheduler._test.childEvidence.set(
+      'c1',
+      Date.now() - 60_000 * CHILD_STALENESS_INTERVALS - 1,
+    );
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('mixed fallback children: terminal suppressed, running wakes, get failure is fail-soft', async () => {
+    const promptAsync = mock(async () => ({}));
+    const get = mock(async (args: { path?: { id?: string } }) => {
+      const id = args?.path?.id;
+      if (id === 'c-terminal') {
+        return {
+          data: { outcome: 'succeeded', time: { updated: Date.now() } },
+        };
+      }
+      if (id === 'c-running') {
+        return { data: { time: { updated: Date.now() } } };
+      }
+      if (id === 'c-throws') throw new Error('get unavailable');
+      return { data: {} };
+    });
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [], get }),
+    });
+    for (const id of ['c-terminal', 'c-running', 'c-throws']) {
+      await scheduler.event({
+        event: {
+          type: 'session.created',
+          properties: { info: { id, parentID: 'p1' } },
+        },
+      });
+    }
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('children mode on v1 (explicit opt-in)', () => {
@@ -1765,9 +1967,13 @@ describe('children mode on v1 (explicit opt-in)', () => {
       promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
     )[0]?.[0] as {
       delivery?: string;
+      modelVariant?: string;
       body: { parts: Array<{ text: string }> };
     };
     expect(call.delivery).toBeUndefined(); // v1 call shape unchanged
+    // The default makeClient get reports a 'high' variant; v1 must still
+    // never receive the v2-only modelVariant argument.
+    expect(call.modelVariant).toBeUndefined();
     expect(call.body.parts[0]?.text).toBe(
       `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
