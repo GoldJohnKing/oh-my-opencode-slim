@@ -57,9 +57,6 @@ export const AgentColorSchema = z.union([
 
 // Agent override configuration (distinct from SDK's AgentConfig)
 export const ModelInheritanceSourceSchema = z.enum(['session', 'orchestrator']);
-export type ModelInheritanceSource = z.infer<
-  typeof ModelInheritanceSourceSchema
->;
 
 export const AgentOverrideConfigSchema = z
   .object({
@@ -434,9 +431,6 @@ export const AcpAgentConfigSchema = z
 
 export const AcpAgentsConfigSchema = z.record(z.string(), AcpAgentConfigSchema);
 
-export type AcpAgentPermissionMode = z.infer<
-  typeof AcpAgentPermissionModeSchema
->;
 export type AcpAgentConfig = z.infer<typeof AcpAgentConfigSchema>;
 export type AcpAgentsConfig = z.infer<typeof AcpAgentsConfigSchema>;
 

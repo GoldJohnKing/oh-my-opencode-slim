@@ -13,7 +13,6 @@ export {
   isTaggedPart,
   isVolatileTaggedMessage,
   stripTaggedContent,
-  type TaggedSyntheticPartSpec,
 } from './cache-safe-injection';
 export { createChatHeadersHook } from './chat-headers';
 export { createDeepworkCommandHook } from './deepwork';
@@ -21,7 +20,6 @@ export { createFilterAvailableSkillsHook } from './filter-available-skills';
 export {
   ForegroundFallbackManager,
   isFailoverError,
-  isRetryableError,
 } from './foreground-fallback';
 export { processImageAttachments } from './image-hook';
 export { createJsonErrorRecoveryHook } from './json-error-recovery/hook';
