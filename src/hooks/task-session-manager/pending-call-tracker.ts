@@ -45,6 +45,7 @@ export interface PendingCallTracker {
   peekByParentAndAgent(
     parentSessionId: string,
     agentHint?: string,
+    title?: string,
   ): PendingTaskCall | undefined;
   adoptEarlyRegistrations(
     backgroundJobBoard: BackgroundJobStore,
@@ -129,27 +130,44 @@ export function createPendingCallTracker(
     },
 
     /**
-     * Peek a pending call for a parent, preferring one whose agentType
-     * matches `agentHint`. Used by session.created early registration:
-     * when a parent launches several parallel task tools with different
-     * subagent types (e.g. council reviewers), `info.agent` on the
-     * child session identifies which subagent started it, so we can
-     * avoid attributing the child to the wrong pending call.
-     * Falls back to the oldest pending call for the parent when no
-     * agent match is found (preserves prior behavior).
+     * Peek a pending call for a parent, only when it can be identified
+     * unambiguously. The v2 host stamps the child session title with the
+     * tool call's `description` argument, so an exact label match
+     * identifies the originating call even among same-agent parallel
+     * launches. When a title is known but matches no unique pending, the
+     * owning call's pending is already consumed (or labels collide) —
+     * refuse rather than guess, because a wrong pairing mis-attributes
+     * the child session (see docs/superpowers/plans/2026-09-12-
+     * task-session-parallel-pairing.md).
      */
-    peekByParentAndAgent(parentSessionId: string, agentHint?: string) {
-      if (!agentHint) return this.peekByParent(parentSessionId);
-      let fallback: PendingTaskCall | undefined;
+    peekByParentAndAgent(
+      parentSessionId: string,
+      agentHint?: string,
+      title?: string,
+    ) {
+      const unmarked: PendingTaskCall[] = [];
       for (const call of pendingCalls.values()) {
-        if (call.parentSessionId !== parentSessionId) continue;
-        if (call.earlyRegisteredTaskID || call.earlyRegistrationRejected) {
-          continue;
+        if (
+          call.parentSessionId === parentSessionId &&
+          !call.earlyRegisteredTaskID &&
+          !call.earlyRegistrationRejected
+        ) {
+          unmarked.push(call);
         }
-        if (!fallback) fallback = call;
-        if (call.agentType === agentHint) return call;
       }
-      return fallback;
+      if (unmarked.length === 0) return undefined;
+
+      if (typeof title === 'string' && title !== '') {
+        const byTitle = unmarked.filter((call) => call.label === title);
+        return byTitle.length === 1 ? byTitle[0] : undefined;
+      }
+
+      if (agentHint) {
+        const byAgent = unmarked.filter((call) => call.agentType === agentHint);
+        return byAgent.length === 1 ? byAgent[0] : undefined;
+      }
+
+      return unmarked.length === 1 ? unmarked[0] : undefined;
     },
 
     adoptEarlyRegistrations(
