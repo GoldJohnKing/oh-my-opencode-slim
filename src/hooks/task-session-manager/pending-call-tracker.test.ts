@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { BackgroundJobBoard } from '../../utils/background-job-board';
 import {
   createPendingCallTracker,
   type PendingTaskCall,
@@ -150,6 +151,25 @@ describe('take', () => {
 
     expect(taken?.callId).toBe('a');
   });
+
+  test('recordConsumed:false rollback does not arm the staleness guard', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    // A before-hook admission error rolls its own pending back without
+    // recording consumption (tool.execute.before catch path).
+    const rolledBack = tracker.take('a', undefined, undefined, {
+      recordConsumed: false,
+    });
+    expect(rolledBack?.callId).toBe('a');
+    expect(tracker.hasConsumedCall('parent-1')).toBe(false);
+
+    // A later no-title same-agent child is still claimable: the
+    // staleness guard was not poisoned by the rollback.
+    const hit = tracker.peekByParentAndAgent('parent-1', 'oracle');
+    expect(hit?.callId).toBe('b');
+  });
 });
 
 describe('takeByTaskID', () => {
@@ -171,5 +191,118 @@ describe('takeByTaskID', () => {
 
     expect(tracker.takeByTaskID('parent-1', 'ses_y')).toBeUndefined();
     expect(tracker.take('a')?.callId).toBe('a');
+  });
+
+  test('leaves a pending owned by another board instance untouched', () => {
+    const tracker = createPendingCallTracker();
+    const ownerBoard = new BackgroundJobBoard();
+    const otherBoard = new BackgroundJobBoard();
+    tracker.add(
+      pending({
+        callId: 'a',
+        earlyRegisteredTaskID: 'ses_x',
+        earlyRegistration: {
+          taskID: 'ses_x',
+          generation: 1,
+          backgroundJobBoard: otherBoard,
+        },
+      }),
+    );
+
+    // A different board generation's after-hook must not steal the
+    // pending claimed under another generation.
+    expect(
+      tracker.takeByTaskID('parent-1', 'ses_x', ownerBoard),
+    ).toBeUndefined();
+
+    // The owning board generation can still resolve it.
+    const taken = tracker.takeByTaskID('parent-1', 'ses_x', otherBoard);
+    expect(taken?.callId).toBe('a');
+  });
+});
+
+describe('takeUnresolvedFirstMatch', () => {
+  test('drains the oldest unmarked pending and records consumption', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    const taken = tracker.takeUnresolvedFirstMatch('parent-1', {
+      identityTaskID: 'ses_new',
+    });
+
+    expect(taken?.callId).toBe('a');
+    // Consumption is recorded like take(): a later no-title child of
+    // the same agent is treated as possibly stale.
+    expect(tracker.hasConsumedCall('parent-1', 'oracle')).toBe(true);
+    expect(tracker.take('b')?.callId).toBe('b');
+  });
+
+  test('constrains by agent when the child agent is known', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'f1', agentType: 'fixer' }));
+    tracker.add(pending({ callId: 'o1', agentType: 'oracle' }));
+
+    // The output belongs to an oracle child: the older fixer pending
+    // is not consumed.
+    const taken = tracker.takeUnresolvedFirstMatch('parent-1', {
+      identityTaskID: 'ses_x',
+      agentType: 'oracle',
+    });
+
+    expect(taken?.callId).toBe('o1');
+    expect(tracker.take('f1')?.callId).toBe('f1');
+  });
+
+  test('returns undefined when no pending matches the known agent', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'f1', agentType: 'fixer' }));
+
+    expect(
+      tracker.takeUnresolvedFirstMatch('parent-1', {
+        identityTaskID: 'ses_x',
+        agentType: 'oracle',
+      }),
+    ).toBeUndefined();
+    expect(tracker.take('f1')?.callId).toBe('f1');
+  });
+
+  test('never consumes early-registered or rejected pendings', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', earlyRegisteredTaskID: 'ses_x' }));
+    tracker.add(pending({ callId: 'b', earlyRegistrationRejected: true }));
+    tracker.add(pending({ callId: 'c' }));
+
+    expect(tracker.takeUnresolvedFirstMatch('parent-1')?.callId).toBe('c');
+  });
+
+  test('skips resumed pendings pinned to a different task ID', () => {
+    const tracker = createPendingCallTracker();
+    tracker.add(pending({ callId: 'a', resumedTaskId: 'ses_old' }));
+    tracker.add(pending({ callId: 'b' }));
+
+    // 'a' is a relaunch of ses_old; an output carrying ses_new cannot
+    // belong to it, so the drain skips to the next candidate.
+    const taken = tracker.takeUnresolvedFirstMatch('parent-1', {
+      identityTaskID: 'ses_new',
+    });
+    expect(taken?.callId).toBe('b');
+
+    // An output carrying the resumed ID may still drain it.
+    const pinned = createPendingCallTracker();
+    pinned.add(pending({ callId: 'a', resumedTaskId: 'ses_old' }));
+    expect(
+      pinned.takeUnresolvedFirstMatch('parent-1', {
+        identityTaskID: 'ses_old',
+      })?.callId,
+    ).toBe('a');
+  });
+
+  test('returns undefined for a parent with no pendings', () => {
+    const tracker = createPendingCallTracker();
+
+    expect(
+      tracker.takeUnresolvedFirstMatch('parent-1', { identityTaskID: 'ses_x' }),
+    ).toBeUndefined();
   });
 });

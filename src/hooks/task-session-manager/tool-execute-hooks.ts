@@ -293,6 +293,14 @@ export async function handleToolExecuteAfter(
         taskID: string,
         ownerBoard?: BackgroundJobStore,
       ): PendingTaskCall | undefined;
+      takeUnresolvedFirstMatch(
+        sessionID: string,
+        selection?: {
+          identityTaskID?: string;
+          agentType?: string;
+          ownerBoard?: BackgroundJobStore;
+        },
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };
     taskContextTracker: {
@@ -342,12 +350,13 @@ export async function handleToolExecuteAfter(
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
+  let identityTaskID: string | undefined;
   if (!pending && typeof output.output === 'string') {
     // No tool call ID (or unknown one): resolve identity via the task
     // ID parsed from this call's own output, matched against the
     // pending the early registration claimed for that child. This
     // avoids guessing by insertion order among parallel calls.
-    const identityTaskID = parseTaskIdFromTaskOutput(output.output);
+    identityTaskID = parseTaskIdFromTaskOutput(output.output);
     if (identityTaskID && input.sessionID) {
       pending = deps.pendingCallTracker.takeByTaskID(
         input.sessionID,
@@ -360,6 +369,39 @@ export async function handleToolExecuteAfter(
           { taskID: identityTaskID, callID: pending.callId },
         );
       }
+    }
+  }
+  if (!pending && !exactCallID && identityTaskID && input.sessionID) {
+    // Both identity sources missed: a parallel no-callID burst where
+    // no early registration claimed the parsed task ID. Returning
+    // here would strand a pending — its concurrency ticket never
+    // releases, and sole-survivor takes refuse forever while it
+    // remains (parent poisoning). The task ID parsed from this call's
+    // own output is authoritative, so drain the oldest eligible
+    // pending through the guarded first-match fallback and let the
+    // normal try/finally path release the ticket and process output.
+    const childRecord = deps.backgroundJobBoard.get(identityTaskID);
+    const childAgent =
+      childRecord && childRecord.parentSessionID === input.sessionID
+        ? childRecord.agent
+        : undefined;
+    pending = deps.pendingCallTracker.takeUnresolvedFirstMatch(
+      input.sessionID,
+      {
+        identityTaskID,
+        agentType: childAgent,
+        ownerBoard: deps.backgroundJobBoard,
+      },
+    );
+    if (pending) {
+      log(
+        '[task-session-manager] unresolvable no-ID take; consuming first-match pending (drain fallback)',
+        {
+          taskID: identityTaskID,
+          callID: pending.callId,
+          consumedAgent: pending.agentType,
+        },
+      );
     }
   }
   log('[task-session-manager] tool.execute.after task', {

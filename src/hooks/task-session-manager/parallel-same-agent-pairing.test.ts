@@ -1,10 +1,22 @@
 import { describe, expect, mock, test } from 'bun:test';
+import * as fsp from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { BackgroundTaskConcurrency } from '../../utils/background-task-concurrency';
 import { createTaskSessionManagerHook } from './index';
+import { createPendingCallTracker } from './pending-call-tracker';
 
 const PARENT = 'parent-1';
 
-function createHook(board: BackgroundJobBoard) {
+function createHook(
+  board: BackgroundJobBoard,
+  extra: {
+    backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    pendingCallTracker?: ReturnType<typeof createPendingCallTracker>;
+  } = {},
+) {
   return createTaskSessionManagerHook(
     {
       client: { session: { status: mock(async () => ({ data: {} })) } },
@@ -15,6 +27,7 @@ function createHook(board: BackgroundJobBoard) {
       maxSessionsPerAgent: 2,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
+      ...extra,
     },
   );
 }
@@ -258,5 +271,238 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
     expect(board.taskIDs()).toEqual(new Set([sA, sB]));
     expect(board.get(sA)?.description).toBe(L_A);
     expect(board.get(sB)?.description).toBe(L_B);
+  });
+
+  test('no-callID no-title parallel burst drains instead of poisoning the parent (B1)', async () => {
+    const board = new BackgroundJobBoard();
+    const concurrency = new BackgroundTaskConcurrency({
+      defaultConcurrency: 2,
+      providerConcurrency: {},
+      modelConcurrency: {},
+    });
+    const tracker = createPendingCallTracker();
+    const hook = createHook(board, {
+      backgroundTaskConcurrency: concurrency,
+      pendingCallTracker: tracker,
+    });
+    const sA = 'ses_aaaa1111';
+    const sB = 'ses_bbbb2222';
+    const sC = 'ses_dddd4444';
+    const completed = (taskID: string) =>
+      [
+        `task_id: ${taskID}`,
+        'state: completed',
+        '',
+        '<task_result>',
+        'Review finished.',
+        '</task_result>',
+      ].join('\n');
+    const noIDBefore = (description: string) =>
+      [
+        { tool: 'task', sessionID: PARENT },
+        {
+          args: {
+            subagent_type: 'oracle',
+            description,
+            prompt: 'do the review',
+            background: true,
+          },
+        },
+      ] as const;
+
+    // Parallel burst WITHOUT callIDs and WITHOUT titles: both
+    // background admissions take their concurrency tickets.
+    await hook['tool.execute.before'](...noIDBefore(L_A));
+    await hook['tool.execute.before'](...noIDBefore(L_B));
+    expect(concurrency.snapshot()).toEqual({ active: 2, queued: 0 });
+
+    // No-title children are ambiguous → placeholders claim no pending.
+    await hook.event(created({ child: sA }));
+    await hook.event(created({ child: sB }));
+    expect(board.get(sA)?.description).toBe('unattributed oracle task');
+    expect(board.get(sB)?.description).toBe('unattributed oracle task');
+
+    // after A parses sA from its own output: take() refuses (2
+    // pendings), takeByTaskID misses (nothing claimed sA) → the drain
+    // fallback consumes exactly one pending and the output flows
+    // through the normal ticket-release path.
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: completed(sA) },
+    );
+    expect(tracker.peekByParent(PARENT)?.callId).toBe('parent-1:anonymous-2');
+    // Ticket A was bound to sA and released on the terminal status —
+    // only B's admission slot remains held.
+    expect(concurrency.snapshot()).toEqual({ active: 1, queued: 0 });
+    // The board record carries the authoritative task ID from A's own
+    // output, with A's label (placeholder corrected).
+    expect(board.get(sA)?.description).toBe(L_A);
+    expect(board.get(sA)?.state).toBe('completed');
+
+    // after B resolves through the normal sole-survivor take — the
+    // burst did not strand anything or poison the parent.
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: completed(sB) },
+    );
+    expect(board.get(sB)?.description).toBe(L_B);
+    expect(concurrency.snapshot()).toEqual({ active: 0, queued: 0 });
+
+    // A subsequent no-ID call for this parent still works end-to-end.
+    await hook['tool.execute.before'](...noIDBefore(L_C));
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: PARENT },
+      { output: HOST_LAUNCH(sC) },
+    );
+    expect(board.get(sC)?.description).toBe(L_C);
+  });
+
+  test('B1 drain fallback logs exactly one deterministic warning per burst', async () => {
+    // Log-file assertions run in a subprocess: other test files
+    // mock.module('../../utils/logger') globally in shared-process
+    // runs, so the real logger is only observable with a pristine
+    // module registry (same pattern as runtime-status-reconciliation).
+    const logDir = await fsp.mkdtemp(
+      path.join(os.tmpdir(), 'omos-b1-drain-log-'),
+    );
+    const workerSource = `
+      const { createTaskSessionManagerHook } = await import(
+        process.env.HOOK_MODULE_URL
+      );
+      const { BackgroundJobBoard } = await import(
+        process.env.BOARD_MODULE_URL
+      );
+      const { BackgroundTaskConcurrency } = await import(
+        process.env.CONCURRENCY_MODULE_URL
+      );
+      const { initLogger, flushLoggerForTesting } = await import(
+        process.env.LOGGER_MODULE_URL
+      );
+      const { readFileSync } = await import('node:fs');
+      initLogger('drain-fallback-b1');
+      const board = new BackgroundJobBoard();
+      const concurrency = new BackgroundTaskConcurrency({
+        defaultConcurrency: 2,
+        providerConcurrency: {},
+        modelConcurrency: {},
+      });
+      const hook = createTaskSessionManagerHook(
+        {
+          client: { session: { status: async () => ({ data: {} }) } },
+          directory: '/tmp',
+          worktree: '/tmp',
+        },
+        {
+          maxSessionsPerAgent: 2,
+          backgroundJobBoard: board,
+          backgroundTaskConcurrency: concurrency,
+          shouldManageSession: () => true,
+        },
+      );
+      const PARENT = 'parent-1';
+      const L_A = 'Review v2 compat layer PRs';
+      const L_B = 'Review wake/synthetic PR chain';
+      const completed = (taskID) =>
+        [
+          'task_id: ' + taskID,
+          'state: completed',
+          '',
+          '<task_result>',
+          'Review finished.',
+          '</task_result>',
+        ].join('\\n');
+      const created = (child) => ({
+        event: {
+          type: 'session.created',
+          properties: { info: { id: child, parentID: PARENT, agent: 'oracle' } },
+        },
+      });
+      const before = (description) => [
+        { tool: 'task', sessionID: PARENT },
+        {
+          args: {
+            subagent_type: 'oracle',
+            description,
+            prompt: 'do the review',
+            background: true,
+          },
+        },
+      ];
+      await hook['tool.execute.before'](...before(L_A));
+      await hook['tool.execute.before'](...before(L_B));
+      await hook.event(created('ses_aaaa1111'));
+      await hook.event(created('ses_bbbb2222'));
+      await hook['tool.execute.after'](
+        { tool: 'task', sessionID: PARENT },
+        { output: completed('ses_aaaa1111') },
+      );
+      await hook['tool.execute.after'](
+        { tool: 'task', sessionID: PARENT },
+        { output: completed('ses_bbbb2222') },
+      );
+      await flushLoggerForTesting();
+      const lines = readFileSync(process.env.LOG_FILE_PATH, 'utf8').split(
+        '\\n',
+      );
+      console.log(
+        JSON.stringify({
+          drainWarnings: lines.filter((line) =>
+            line.includes(
+              'unresolvable no-ID take; consuming first-match pending (drain fallback)',
+            ),
+          ).length,
+          identityResolutions: lines.filter((line) =>
+            line.includes(
+              'resolved task output identity via early-registered task ID',
+            ),
+          ).length,
+        }),
+      );
+    `;
+    const proc = Bun.spawn([process.execPath, '-e', workerSource], {
+      cwd: import.meta.dir,
+      env: {
+        ...process.env,
+        OPENCODE_LOG_DIR: logDir,
+        HOOK_MODULE_URL: pathToFileURL(path.join(import.meta.dir, 'index.ts'))
+          .href,
+        BOARD_MODULE_URL: pathToFileURL(
+          path.join(import.meta.dir, '../../utils/background-job-board.ts'),
+        ).href,
+        CONCURRENCY_MODULE_URL: pathToFileURL(
+          path.join(
+            import.meta.dir,
+            '../../utils/background-task-concurrency.ts',
+          ),
+        ).href,
+        LOGGER_MODULE_URL: pathToFileURL(
+          path.join(import.meta.dir, '../../utils/logger.ts'),
+        ).href,
+        LOG_FILE_PATH: path.join(
+          logDir,
+          'oh-my-opencode-slim.drain-fallback-b1.log',
+        ),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    await fsp.rm(logDir, { recursive: true, force: true });
+    if (exitCode !== 0) {
+      console.error(stderr);
+      expect(exitCode).toBe(0);
+    }
+    const counts = JSON.parse(stdout.trim()) as {
+      drainWarnings: number;
+      identityResolutions: number;
+    };
+    // Only after A hits the fallback; after B resolves via the normal
+    // sole-survivor take.
+    expect(counts.drainWarnings).toBe(1);
+    expect(counts.identityResolutions).toBe(0);
   });
 });
