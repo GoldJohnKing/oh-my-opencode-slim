@@ -61,11 +61,11 @@ entrypoint v2 loads when the `dist/server` directory is registered directly
 (see [Installing on v2](#installing-on-v2)); the release artifact check
 requires it. v1 uses the main entry.
 
-Verified against opencode2 `beta-19365` (all bridges green — health check
-`bridges:11`; live mock-driven re-verification on 2026-09-09 exercised the
-event-stream bridge end-to-end, including the orchestrator-wake
-children-driven degraded mode firing a queued wake after 60 s of parent
-idle with a stalled background child). Every v2 API the adapter touches is
+Verified live on OpenCode v2 (all bridges green — health check
+`bridges:11`; the event stream, bridges, and orchestrator-wake
+children-driven degraded mode are exercised end-to-end on the stable host,
+including a queued wake firing after 60 s of parent idle with a stalled
+background child). Every v2 API the adapter touches is
 capability-probed at runtime (`typeof ctx.mcp?.transform === 'function'`,
 `s.switchModel`, `ctx.generate`, …), so a host lacking one capability
 degrades that single feature with a log line instead of breaking the load.
@@ -151,9 +151,8 @@ degrades that single feature with a log line instead of breaking the load.
     - `event` → `ctx.event.subscribe()` loop feeding `mapV2EventToV1`
       (`src/v2/event-adapter.ts`): additive synthesis only — the raw v2 event
       is always dispatched first (the interview bridge depends on it), then
-      synthesized v1 shapes: idle `session.status` → `session.idle`, flat
-      child `session.created` → v1 early-registration
-      `{info: {id, parentID, agent?}}`, usage telemetry
+      synthesized v1 shapes: flat child `session.created` → v1
+      early-registration `{info: {id, parentID, agent?}}`, usage telemetry
       (`session.usage.updated`/`session.step.ended`) → a deduplicated
       completed-assistant `message.updated` for the cache monitor, the Form
       flow (`form.created`/`form.replied`/`form.cancelled`) → v1
@@ -162,19 +161,19 @@ degrades that single feature with a log line instead of breaking the load.
       sentinel are skipped), and `permission.asked` field mapping to the v1
       names (`permission` ← `action`, `patterns` ← `resources`;
       `permission.replied` passes through raw — v2's shape already matches
-      the v1 event). Newer hosts (verified live on beta-19365/beta-19378)
-      publish durable `session.execution.started/succeeded/failed/
-      interrupted` and no longer stream busy/idle `session.status` on the
-      event flow; those events are synthesized into the same v1 lifecycle
-      shapes (`started` → busy `session.status`; terminal subtypes → idle
-      `session.status` + `session.idle`; `failed` additionally emits a v1
-      `session.error` with the host error payload before the idle pair).
-      The `session.status` → `session.idle` path is retained for older
-      builds — hosts emitting both simply deliver idle repeatedly, which
-      the double-idle invariant tolerates. This is what keeps the
-      companion's waiting-input indicator, the task-session-manager
-      input-wait gate, orchestrator-wake suppression/arm scheduling, and
-      the foreground fallback working on v2 hosts.
+      the v1 event). V2 hosts publish durable `session.execution.started/
+      succeeded/failed/interrupted` and emit no busy/idle `session.status`
+      and no `session.idle` on the event stream — the observed payloads
+      always ride under `data` (verified live, 80-event capture). The
+      adapter synthesizes the v1 lifecycle shapes from those execution
+      events (`started` → busy `session.status`; terminal subtypes → idle
+      `session.status` + `session.idle`; `failed` → a v1 `session.error`
+      with the host error payload before the idle pair), and no
+      `session.status`-based fallback remains. The execution-event
+      synthesis keeps orchestrator-wake suppression/arm scheduling and the
+      foreground fallback working on v2 hosts, while the Form and
+      permission bridges above feed the companion's waiting-input
+      indicator and the task-session-manager input-wait gate.
    - `generate.text` → one-shot generation channel probed on `ctx.generate`
      and threaded as `experimental_v2.generateText`, powering the webfetch
      secondary-model summaries without a temp session
@@ -198,7 +197,7 @@ the rest, and a zero-registration load logs a loud health-check warning.
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | — |
 | webfetch secondary-model summaries | ✅ | ✅ via `ctx.generate.text` | host without `ctx.generate` → summaries unavailable (logged) |
 | Foreground model fallback (rate-limit failover) | ✅ | ✅ shim translates re-prompt into `session.switchModel` + `delivery:"steer"` prompt | — |
-| `/preset` (interactive switcher) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar + `/preset` dialog or `/preset <name>` fast path | TUI host needs `keymap.layer` + `ui.dialog.select`; config-file `preset` still applies at load |
+| `/preset` (interactive switcher) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar + `/preset` dialog or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the interactive picker needs `ui.dialog.select` while `/preset <name>` works without it; feedback uses `ui.toast.show`; config-file `preset` still applies at load |
 | TUI default agent | ✅ orchestrator | ✅ orchestrator — `draft.default("orchestrator")`; the v2 TUI honors `default_agent` and hoists the default to the head of the agent list | — |
 | Multiplexer (tmux/zellij/herdr/cmux panes) | ✅ | ❌ host-gated off (`hostFlavor: 'v2'` → `shouldEnableMultiplexer` returns false and the session manager is forced to `type: "none"`) | by design — v2 renders subagents natively |
 | Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ✅ children-driven degraded mode (`backgroundJobs.orchestratorWake.mode`) | v2 wake enumerates children via `session.list({parentID})` with an event-tracked fallback, gates on children without a terminal `outcome` (staleness-bounded), and delivers with `queue`; v2's native subagent completion nudges still cover the happy path — the port adds a periodic watchdog for stuck children and unreconciled jobs |
@@ -212,28 +211,25 @@ currently break this plugin:
 
 - **Event payloads ride under `data`, not `properties`.** The v2
   event stream (SSE and `ctx.event.subscribe()`) frames each event as
-  `{id, created, type, location?, durable?, data}` — the payload is the
-  `data` record, unlike the v1 SDK's `properties` (verified live on
-  beta-19365: every observed event keyed exactly
-  `["id","created","type","durable","data"]`). The adapter reads `data`
-  first with `properties` as a legacy fallback and always writes
-  `properties` on the synthesized v1 shapes, because that is the key the
-  v1 consumers read.
-- **Lifecycle keys on `session.execution.*` on newer hosts.** Verified
-  live hosts (beta-19365/beta-19378) publish durable
+  `{id, created, type, location?, durable?, metadata?, data}` — the payload
+  is the `data` record, unlike the v1 SDK's `properties` (verified live:
+  every observed event keyed `["id","created","type","durable","data"]`,
+  with the optional `metadata?` key observed on some events).
+  The adapter reads `data` first with `properties` as a legacy fallback and
+  always writes `properties` on the synthesized v1 shapes, because that is
+  the key the v1 consumers read.
+- **Lifecycle keys on `session.execution.*`.** V2 hosts publish durable
   `session.execution.started/succeeded/failed/interrupted` events
   (`{sessionID}`, plus `error` on `.failed` and `reason` on
-  `.interrupted`) and no longer publish busy/idle `session.status` on
-  the SSE event stream (`session.status` remains only in the schema).
-  The adapter synthesizes the v1 lifecycle shapes from the execution
-  events (`started` → busy `session.status`; terminal subtypes → idle
-  `session.status` + `session.idle`; `failed` → a v1 `session.error`
+  `.interrupted`) and emit no busy/idle `session.status` and no
+  `session.idle` on the event stream (`session.status` remains only in the
+  schema). The adapter synthesizes the v1 lifecycle shapes from the
+  execution events (`started` → busy `session.status`; terminal subtypes →
+  idle `session.status` + `session.idle`; `failed` → a v1 `session.error`
   with the host error payload passed through best-effort, emitted before
   the idle pair so the error-then-idle flow the event-router expects is
-  preserved). The `session.status` mapping is retained for older builds;
-  a host emitting both delivers idle repeatedly — the double-idle
-  invariant above covers it. Without this synthesis the
-  orchestrator-wake scheduler never arms on live v2 hosts.
+  preserved). Without this synthesis the orchestrator-wake scheduler never
+  arms on live v2 hosts.
 - **Transcript user messages carry no identity.** Context-hook
   transcript user messages on live v2 hosts carry `{id, time, text,
   type}` only — no `agent`, no `sessionID`. The v1 injection gates
@@ -256,11 +252,12 @@ currently break this plugin:
   v1 hosts expose the method and keep the exact historical polling
   behavior. Background job stop-confirmation was never obtainable from
   the v2 poll anyway (the lookup failed every time).
-- **Duplicate idle delivery.** v2 favors `session.status` over
-  `session.idle`; the adapter synthesizes `session.idle` additively, so a
-  consumer watching both events sees idle twice per session. Current
-  consumers are idempotent per session (idle-reconciliation's per-session
-  timer guards); new idle consumers must tolerate duplicate delivery.
+- **Duplicate idle delivery.** The adapter synthesizes both an idle
+  `session.status` and a `session.idle` from each terminal execution event,
+  so a consumer watching both sees idle twice per terminal transition.
+  Current consumers are idempotent per session (idle-reconciliation's
+  per-session timer guards); new idle consumers must tolerate duplicate
+  delivery.
 - **Duplicate `permission.asked` delivery.** The adapter appends a
   v1-field-mapped copy after the raw v2 `permission.asked` event (raw
   first is a load-bearing invariant for v2-native handlers). Consumers
@@ -382,10 +379,16 @@ How it differs from the v1 path:
   historical probe set (`get`/`todo`/`children`/`status`/`promptAsync`).
 - **Children enumeration:** `session.list({ parentID })` through the shim
   (v2 `Session.Info` → v1 envelope; `outcome` and `time.updated` mapped).
-  When the listing is unavailable (missing/erroring/empty), an event-tracked
-  fallback uses the adapter-synthesized `session.created` parentID links plus
-  tracked busy/idle statuses. Results are scoped to the session's directory
-  when the host reports one.
+  The in-process session surface of current v2 hosts does not expose
+  `list`, so the empty page falls back to an event-tracked view — the
+  adapter-synthesized `session.created` parentID links plus tracked
+  busy/idle statuses — refreshed on every evaluation with the host's
+  authoritative `outcome`/`time.updated` via `session.get` (fail-soft per
+  child). A finished child is therefore terminal immediately instead of
+  reading active for the whole staleness window, and a live child stays
+  visible on its host evidence rather than dropping out on stale local
+  evidence. Results are scoped to the session's directory when the host
+  reports one.
 - **Wake condition:** children with `outcome === undefined` (v2 records an
   outcome only on terminal transition: succeeded|failed|interrupted) that
   still have fresh update evidence — host `time.updated` or a tracked status
@@ -395,6 +398,9 @@ How it differs from the v1 path:
 - **Wake delivery:** `delivery: "queue"` — v1 `prompt_async` queued, and a
   v2 `steer` would hijack an in-flight run. The shim's `promptAsync` keeps
   `steer` as the default so the foreground-fallback replay is unchanged.
+  The wake model pin carries the session model's variant as the v2-only
+  `modelVariant` argument, so `switchModel` preserves the reasoning-effort
+  setting instead of resetting it to the host default.
 - **Fingerprint:** children-only (id + outcome + tracked status + update
   evidence); the two-wake no-progress cap still bounds cost.
 
@@ -416,6 +422,10 @@ respawn, bounded by the same no-progress cap as v1.
   `health check passed {"bridges":4}` — expected noise from that parallel
   pass, not breakage. The classic `server()` path (a separate plugin-log
   instance a few seconds apart) carries the full v1 functionality.
+- **TUI-side plugin logs are not captured.** The plugin logger initializes
+  in the server process only, so TUI-side registration failures write no
+  `[v2][tui]` lines anywhere. Verify TUI behavior through the host (command
+  availability, on-disk effects), not via the plugin log.
 - **Local-checkout loading.** When the plugin is registered from a local
   build, the externalized `jsdom` import must resolve from the plugin's
   `node_modules` (webfetch imports it lazily, so the plugin still loads

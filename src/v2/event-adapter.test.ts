@@ -62,38 +62,6 @@ describe('mapV2EventToV1', () => {
     expect(() => mapV2EventToV1(ev)).not.toThrow();
   });
 
-  test('synthesizes session.idle from idle session.status', () => {
-    const ev = {
-      type: 'session.status',
-      properties: { sessionID: 's', status: { type: 'idle' } },
-    };
-    const out = mapV2EventToV1(ev);
-    expect(out).toHaveLength(2);
-    expect(out[0]).toBe(ev);
-    expect(out[1]).toEqual({
-      type: 'session.idle',
-      properties: { sessionID: 's' },
-    });
-  });
-
-  test('busy status does not synthesize idle', () => {
-    expect(
-      mapV2EventToV1({
-        type: 'session.status',
-        properties: { sessionID: 's', status: { type: 'busy' } },
-      }),
-    ).toHaveLength(1);
-  });
-
-  test('idle status without a sessionID does not synthesize idle', () => {
-    expect(
-      mapV2EventToV1({
-        type: 'session.status',
-        properties: { status: { type: 'idle' } },
-      }),
-    ).toHaveLength(1);
-  });
-
   test('maps session.created with parentID into v1 early-registration shape', () => {
     const ev = {
       type: 'session.created',
@@ -226,11 +194,23 @@ describe('mapV2EventToV1', () => {
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('prompt-cache bust');
   });
+
+  test('raw session.status events stay passthrough-only', () => {
+    const ev = deepFreeze({
+      id: 'evt_status',
+      created: 1_788_961_637_000,
+      type: 'session.status',
+      data: { sessionID: 'ses_status', status: { type: 'idle' } },
+    });
+    const out = mapV2EventToV1(ev);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toBe(ev);
+  });
 });
 
 describe('mapV2EventToV1 session.execution.* lifecycle synthesis', () => {
-  // Newer v2 hosts (verified live beta-19365/beta-19378) publish durable
-  // session.execution.* events and no longer stream busy/idle
+  // v2 hosts publish durable
+  // session.execution.* events and stream no busy/idle
   // session.status — these tests pin the synthesized v1 lifecycle shapes
   // the wake scheduler / task-session-manager / fallback consumers read.
   test('execution.started synthesizes v1 busy session.status', () => {
@@ -352,42 +332,6 @@ describe('mapV2EventToV1 session.execution.* lifecycle synthesis', () => {
     expect(mapV2EventToV1(ev)).toEqual([ev]);
   });
 
-  test('older host emitting BOTH session.status idle and execution.succeeded keeps single logical idle (double-idle invariant)', () => {
-    // Composition is per-event and additive; a consumer watching idle
-    // across both deliveries sees idle four times (raw idle
-    // session.status + its synthesized session.idle; succeeded's
-    // synthesized idle session.status + session.idle) — all for the
-    // same single logical idle transition, tolerated because every
-    // idle consumer is idempotent per session (the documented invariant
-    // beginContinuousIdle / idle-reconciliation rely on).
-    const idleDeliveries: string[] = [];
-    for (const ev of [
-      {
-        type: 'session.status',
-        properties: { sessionID: 's', status: { type: 'idle' } },
-      },
-      { type: 'session.execution.succeeded', properties: { sessionID: 's' } },
-    ]) {
-      for (const mapped of mapV2EventToV1(ev)) {
-        if (mapped.type === 'session.idle') {
-          idleDeliveries.push(
-            (mapped.properties as { sessionID: string }).sessionID,
-          );
-        }
-        if (
-          mapped.type === 'session.status' &&
-          (mapped.properties as { status?: { type?: string } }).status?.type ===
-            'idle'
-        ) {
-          idleDeliveries.push(
-            (mapped.properties as { sessionID: string }).sessionID,
-          );
-        }
-      }
-    }
-    expect(idleDeliveries).toEqual(['s', 's', 's', 's']);
-  });
-
   test('synthesized lifecycle pair feeds the real task-session-manager busy path', async () => {
     // End-to-end against the consumer: the synthesized busy status must
     // mark a tracked child running-from-live-session on the board.
@@ -423,13 +367,12 @@ describe('mapV2EventToV1 session.execution.* lifecycle synthesis', () => {
 
 describe('mapV2EventToV1 live wire shape (payload under `data`)', () => {
   // Live v2 hosts deliver plugin/SSE events as
-  // `{id, created, type, location?, durable?, data}` — the OpenCodeEvent
-  // wire shape (verified live on beta-19365: every event keys observed as
-  // ["id","created","type","durable","data"] with no `properties` key).
-  // The `properties` spelling used by the tests above is the legacy
-  // fallback. These tests pin the live-observed shapes end-to-end through
-  // the exact wake-arming chain: execution.succeeded → idle pair →
-  // beginContinuousIdle, and session.created → child registration.
+  // `{id, created, type, location?, durable?, metadata?, data}` with the
+  // payload always under `data`. The `properties`
+  // spelling used by the tests above is the legacy fallback. These tests
+  // pin the live-observed shapes end-to-end through the exact wake-arming
+  // chain: execution.succeeded → idle pair → beginContinuousIdle, and
+  // session.created → child registration.
   function liveEvent(
     type: string,
     data: Record<string, unknown>,
@@ -472,7 +415,7 @@ describe('mapV2EventToV1 live wire shape (payload under `data`)', () => {
   });
 
   test('live session.created (flat `data` fields incl. parentID) maps to the v1 early-registration shape', () => {
-    // Shape captured from the live beta-19365 host: a subagent child
+    // Shape captured from a live v2 host: a subagent child
     // session.created with data.parentID linking it to the orchestrator.
     const out = mapV2EventToV1(
       liveEvent('session.created', {
@@ -484,7 +427,7 @@ describe('mapV2EventToV1 live wire shape (payload under `data`)', () => {
         slug: 'playful-orchid',
         title: 'live child detection',
         agent: 'general',
-        version: '0.0.0-beta-19365',
+        version: '2.0.2',
       }),
     );
     expect(out).toHaveLength(2);
@@ -532,18 +475,6 @@ describe('mapV2EventToV1 live wire shape (payload under `data`)', () => {
         },
       },
     });
-  });
-
-  test('live idle session.status synthesizes session.idle from `data`', () => {
-    const out = mapV2EventToV1(
-      liveEvent('session.status', {
-        sessionID: 'ses_live',
-        status: { type: 'idle' },
-      }),
-    );
-    expect(out.slice(1)).toEqual([
-      { type: 'session.idle', properties: { sessionID: 'ses_live' } },
-    ]);
   });
 
   test('live-shape wake chain end-to-end: idle arms the real wake scheduler with a tracked child', async () => {

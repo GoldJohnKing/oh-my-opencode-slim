@@ -547,7 +547,7 @@ describe('createSessionContextHandler (merged context hook seam)', () => {
 });
 
 describe('context bridge: transcript user-message identity enrichment', () => {
-  // Live v2 hosts (verified beta-19365/beta-19378) carry only
+  // Live v2 hosts carry only
   // {id, time, text, type} on transcript user messages; the v1 injection
   // gates (phase-reminder, board, nudge) key on info.sessionID/agent.
   test('user messages gain sessionID/agent when absent; content bytes untouched', async () => {

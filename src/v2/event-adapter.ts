@@ -2,18 +2,20 @@
  * v2 → v1 event mapper for the v2 event pump.
  *
  * v2 renamed/re-shaped several server events the v1 hooks depend on:
- * - `session.idle` is gone (`session.status` with `status.type: 'idle'`);
+ * - the v2 stream carries neither `session.idle` nor busy/idle
+ *   `session.status`; lifecycle arrives as durable `session.execution.*`
+ *   events (live-verified on v2 hosts);
  * - `session.created` carries flat `{sessionID, parentID?}` instead of
  *   v1's `properties.info` object;
  * - token/cache telemetry moved to `session.usage.updated` /
  *   `session.step.ended` (v2 has no `message.updated`).
  *
  * Payload key: live v2 hosts deliver the event payload under `data`
- * (`{id, created, type, location?, durable?, data}` — the wire/plugin
- * `OpenCodeEvent` shape, verified live on beta-19365); the `properties`
- * spelling is accepted as a legacy/test fallback. The v1 consumers the
- * synthesized shapes target all read `properties`, so every synthesized
- * event below writes `properties` regardless of the source key.
+ * (`{id, created, type, location?, durable?, metadata?, data}` — the
+ * wire/plugin `OpenCodeEvent` shape, live-verified on v2 hosts); the
+ * `properties` spelling is accepted as a legacy/test fallback. The v1
+ * consumers the synthesized shapes target all read `properties`, so every
+ * synthesized event below writes `properties` regardless of the source key.
  *
  * `mapV2EventToV1` is additive synthesis only: the first element of the
  * returned array is ALWAYS the raw input event, unmodified (byte-identical
@@ -21,14 +23,13 @@
  * already tolerant of the v2 shape keep seeing it. Synthesized v1-shape
  * events are appended after it.
  *
- * Lifecycle note: newer v2 hosts (verified live on beta-19365/beta-19378)
- * publish durable `session.execution.started/succeeded/failed/interrupted`
- * events and no longer stream busy/idle `session.status` on the SSE event
- * flow (`session.status` remains only in the schema). The execution events
- * are synthesized into the v1 lifecycle shapes below; the idle
- * `session.status` → `session.idle` path is retained for older hosts, and
- * hosts emitting both simply deliver idle more than once — tolerated by
- * the documented double-idle invariant.
+ * Lifecycle note: v2 hosts publish durable
+ * `session.execution.started/succeeded/failed/interrupted` events; the
+ * stream carries neither `session.idle` nor busy/idle `session.status`.
+ * The execution events are synthesized into the v1 lifecycle shapes below.
+ * A terminal execution event synthesizes both a `session.status` idle and
+ * a `session.idle`, so a consumer watching both must tolerate duplicate
+ * idle delivery (the documented double-idle invariant).
  *
  * The synthesized shapes are pinned to what the v1 consumers actually read:
  * - `session.created` early registration (task-session-manager
@@ -249,15 +250,16 @@ function permissionAskedToV1(
  *
  * Returns `[rawEvent, ...synthesizedV1Shapes]` — the raw event is always
  * first and never mutated. Synthesis:
- * - idle `session.status` → v1 `session.idle` `{sessionID}`;
- * - `session.execution.*` (newer hosts; verified live beta-19365/19378)
- *   → the v1 lifecycle shapes: `started` → `session.status`
- *   `{status:{type:'busy'}}`; `succeeded`/`interrupted` → `session.status`
- *   idle + `session.idle`; `failed` → a v1 `session.error` (host error
- *   payload passed through best-effort) followed by the same idle pair —
- *   error-before-idle preserves the error-then-idle flow the
- *   task-session-manager event-router expects (deferred inline errors
- *   are terminalized by the following idle);
+ * - `session.execution.*` → the v1 lifecycle
+ *   shapes: `started` → `session.status` `{status:{type:'busy'}}`;
+ *   `succeeded`/`interrupted` → `session.status` idle + `session.idle`;
+ *   `failed` → a v1 `session.error` (host error payload passed through
+ *   best-effort) followed by the same idle pair — error-before-idle
+ *   preserves the error-then-idle flow the task-session-manager
+ *   event-router expects (deferred inline errors are terminalized by the
+ *   following idle). Only the four known subtypes map — unknown
+ *   `session.execution.*` variants stay passthrough-only rather than
+ *   guessing a lifecycle meaning;
  * - child `session.created` (parentID present) → v1 early-registration
  *   shape `{info: {id, parentID, title?, agent?}}`;
  * - usage telemetry → v1 completed-assistant `message.updated`;
@@ -276,41 +278,21 @@ export function mapV2EventToV1(
   const type = typeof event.type === 'string' ? event.type : '';
   const props = payloadOf(event);
 
-  if (type === 'session.status') {
-    const statusType = isRecord(props.status)
-      ? typeof props.status.type === 'string'
-        ? props.status.type
-        : undefined
-      : undefined;
-    if (statusType === 'idle' && typeof props.sessionID === 'string') {
-      // Double-idle invariant: on v2 an idle-tolerant consumer that watches
-      // BOTH the native `session.status` event and the synthesized
-      // `session.idle` receives idle twice per session. Safe today because
-      // every idle consumer is idempotent per session — idle-reconciliation
-      // guards repeats via its per-session timer maps
-      // (`idleReconcileTimers.has` / `childIdleReconcileTimers.has`,
-      // idle-reconciliation.ts:42,64). Any NEW idle consumer must tolerate
-      // duplicate idle delivery.
-      out.push({
-        type: 'session.idle',
-        properties: { sessionID: props.sessionID },
-      });
-    }
-  } else if (
+  if (
     type === 'session.execution.started' ||
     type === 'session.execution.succeeded' ||
     type === 'session.execution.failed' ||
     type === 'session.execution.interrupted'
   ) {
-    // Newer v2 hosts publish durable `session.execution.*` and no longer
-    // stream busy/idle `session.status` (verified live beta-19365/19378).
+    // v2 hosts publish durable `session.execution.*` and no longer
+    // stream busy/idle `session.status`.
     // Synthesize the v1 lifecycle shapes the wake scheduler, the
-    // task-session-manager, and the foreground fallback key on. The
-    // `session.status` path above still covers older hosts; a host
-    // emitting both delivers idle repeatedly, which the documented
-    // double-idle invariant already tolerates. Only the four verified
-    // subtypes map — unknown `session.execution.*` variants stay
-    // passthrough-only rather than guessing a lifecycle meaning.
+    // task-session-manager, and the foreground fallback key on. Terminal
+    // subtypes synthesize an idle `session.status` + `session.idle` pair,
+    // so a consumer watching both must tolerate duplicate idle (the
+    // documented double-idle invariant). Only the four known subtypes
+    // map — unknown `session.execution.*` variants stay passthrough-only
+    // rather than guessing a lifecycle meaning.
     if (typeof props.sessionID === 'string') {
       const sessionID = props.sessionID;
       if (type === 'session.execution.started') {

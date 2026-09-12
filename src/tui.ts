@@ -479,8 +479,9 @@ export function readCompactSidebar(directory: string): boolean {
   return readConfigState(directory).compactSidebar;
 }
 
-// Mirrors @opencode-ai/plugin@0.0.0-beta-17793 dist/tui/context.d.ts;
-// declared locally because the pinned dep ships v1 types only.
+// Mirrors the OpenCode v2 TUI context surface (dist/tui/context.d.ts);
+// declared locally because the pinned @opencode-ai/plugin dep ships v1
+// types only.
 interface V2TuiThemeTokens {
   text: { default: unknown; subdued: unknown };
   background: { default: unknown };

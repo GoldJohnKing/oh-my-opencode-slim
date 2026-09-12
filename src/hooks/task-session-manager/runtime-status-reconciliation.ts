@@ -30,8 +30,8 @@ export function createRuntimeStatusReconciler(options: {
   let activeReconcile: Promise<void> | undefined;
   let rerunRequested = false;
 
-  // Capability gate: hosts without `client.session.status` (live v2 —
-  // verified beta-19365/beta-19378) can never produce a status snapshot;
+  // Capability gate: hosts without `client.session.status` (live v2) can
+  // never produce a status snapshot;
   // every poll would throw "client.session.status is not a function" and
   // log reconciliation uncertainty (~5s of pure noise). Skip the loop
   // entirely with a single per-instance disable notice instead. v1 hosts
