@@ -1009,12 +1009,15 @@ describe('tool execute bridge normalization', () => {
     );
     expect(chatCalls.at(-1)).toEqual({ ...base, messageID: 'u1' });
 
-    // user-not-last: the LAST user message wins, not the first.
+    // user-not-last: the LAST user message wins, not the first —
+    // and a trailing NON-user message must be skipped by the
+    // backward scan (a `messages.at(-1)`-only regression would fail).
     await handler(
       makeEvent([
         { id: 'u2', role: 'user', content: [] },
         { id: 'a2', role: 'assistant', content: [] },
         { id: 'u3', role: 'user', content: [] },
+        { id: 'a3', role: 'assistant', content: [] },
       ]),
     );
     expect(chatCalls.at(-1)).toEqual({ ...base, messageID: 'u3' });
