@@ -15,10 +15,10 @@ import {
   deriveFullObjective,
   deriveTaskSessionLabel,
   guardCompletedStatusText,
+  maskTaskOutputStructure,
   parseTaskIdFromTaskOutput,
   parseTaskLaunchOutput,
   parseTaskStatusOutput,
-  redactSecretsForLog,
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
@@ -480,15 +480,17 @@ export async function handleToolExecuteAfter(
       // host actually returned so format drift is diagnosable from the
       // plugin log (board-injection has its own textPreview for
       // synthetic parts — this one covers the native tool result path).
-      // Redact the FULL string BEFORE slicing: the logger-level
-      // redaction only sees the already-sliced preview, so a secret
-      // straddling the slice boundary would leak its raw prefix.
-      // Redact-then-slice to 140 (compensating the ellipsis shortening)
-      // shows the mask, not the raw prefix.
+      // Structure-preserving VALUE masking (maskTaskOutputStructure):
+      // parse-miss content is untrusted-by-format, so tag/field names
+      // survive for drift diagnosis but every value is fully hidden as
+      // [masked] — description fields carry orchestrator/user-authored
+      // text. The full string is masked BEFORE slicing (a straddling
+      // secret cannot leak a raw prefix); the logger-level redaction
+      // remains the backstop for every other log site.
       log('[task-session-manager] task output without a task id', {
         callID: pending.callId,
         sessionID: input.sessionID,
-        outputPreview: redactSecretsForLog(output.output).slice(0, 140),
+        outputPreview: maskTaskOutputStructure(output.output).slice(0, 140),
       });
       if (
         pending.resumedTaskId &&

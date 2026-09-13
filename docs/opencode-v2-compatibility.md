@@ -465,13 +465,19 @@ shape-based secret redaction at the logger's single compose point
 `glpat-`, `xox*`, `AKIA`/`ASIA`), URL credentials
 (`scheme://user:password@` — password only), authorization schemes
 (Bearer/Basic/token), and generic 32+-character opaque runs are masked
-to 4 leading + 2 trailing characters. The parse-miss preview redacts
-the full output before slicing so boundary-straddling secrets cannot
-leak a raw prefix. This is a best-effort barrier against *accidental*
-leaks in short previews, not an adversarial guarantee: unprefixed short
-secrets, secrets containing run-breaking characters, and chunked or
-obfuscated content remain residual gaps, while long opaque non-secrets
-(UUIDs, hashes, long paths) are masked as accepted false positives.
+to 4 leading + 2 trailing characters. This is a best-effort barrier
+against *accidental* leaks in short previews, not an adversarial
+guarantee: unprefixed short secrets, secrets containing run-breaking
+characters, and chunked or obfuscated content remain residual gaps,
+while long opaque non-secrets (UUIDs, hashes, long paths) are masked as
+accepted false positives. The parse-miss preview (`task output without
+a task id`) is stricter still: it is **structure-only** — tag and field
+names survive for drift diagnosis, but every value (XML attribute
+values, `key:`/`key=` prose values) is fully replaced with `[masked]`
+before slicing, because parse-miss content is untrusted-by-format and
+values (description fields in particular) carry user-authored text.
+All other log sites rely on the shape-based redaction at the logger
+choke point.
 
 ## Limitations
 
