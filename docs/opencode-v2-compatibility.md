@@ -452,11 +452,26 @@ the v1 factory runs):
 ### Diagnostics
 
 Two log lines aid drift diagnosis (both hosts): the task tool's terminal
-output that carries no parsable task id is logged with a ~120-char
+output that carries no parsable task id is logged with a ~140-char
 preview (`task output without a task id` — the host-output-drift
 detector), and an idle observation for a *tracked managed child* with no
 running board record logs with a `[task-session-manager] WARN:` prefix
 instead of the routine idle line.
+
+**Secret redaction at the logger.** Every plugin log line — file sink,
+stderr fallback, and the append-failure path — passes through
+shape-based secret redaction at the logger's single compose point
+(`src/utils/redact.ts`): known vendor token prefixes (`sk-`, `gh*`,
+`glpat-`, `xox*`, `AKIA`/`ASIA`), URL credentials
+(`scheme://user:password@` — password only), authorization schemes
+(Bearer/Basic/token), and generic 32+-character opaque runs are masked
+to 4 leading + 2 trailing characters. The parse-miss preview redacts
+the full output before slicing so boundary-straddling secrets cannot
+leak a raw prefix. This is a best-effort barrier against *accidental*
+leaks in short previews, not an adversarial guarantee: unprefixed short
+secrets, secrets containing run-breaking characters, and chunked or
+obfuscated content remain residual gaps, while long opaque non-secrets
+(UUIDs, hashes, long paths) are masked as accepted false positives.
 
 ## Limitations
 

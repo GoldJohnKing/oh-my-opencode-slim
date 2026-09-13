@@ -476,16 +476,19 @@ export async function handleToolExecuteAfter(
     const taskId = parseTaskIdFromTaskOutput(output.output);
     if (!taskId) {
       // Host-output-drift detector: the task tool's terminal output no
-      // longer carries a parsable task id. The ~120-char preview shows
-      // what the host actually returned so format drift is diagnosable
-      // from the plugin log (board-injection has its own textPreview for
+      // longer carries a parsable task id. The preview shows what the
+      // host actually returned so format drift is diagnosable from the
+      // plugin log (board-injection has its own textPreview for
       // synthetic parts — this one covers the native tool result path).
-      // Redacted: plugin logs are collected into public GitHub issues by
-      // the report flow, and parse-miss content is untrusted-by-format.
+      // Redact the FULL string BEFORE slicing: the logger-level
+      // redaction only sees the already-sliced preview, so a secret
+      // straddling the slice boundary would leak its raw prefix.
+      // Redact-then-slice to 140 (compensating the ellipsis shortening)
+      // shows the mask, not the raw prefix.
       log('[task-session-manager] task output without a task id', {
         callID: pending.callId,
         sessionID: input.sessionID,
-        outputPreview: redactSecretsForLog(output.output.slice(0, 120)),
+        outputPreview: redactSecretsForLog(output.output).slice(0, 140),
       });
       if (
         pending.resumedTaskId &&
